@@ -119,13 +119,18 @@ $RECYCLE.BIN/
 
 # ── 根目录一次性脚本 ──
 /_*.py
+/_*.json
 /bench*.py
 /bench*.txt
 /benchmark*.py
-/benchmark_v42_*.json
+/benchmark*.json
+/benchmark*.txt
 /profile*.py
 /cprofile*.py
 /cprofile*.log
+/cprofile*.txt
+/cprofile*.out
+/cprofile*.json
 /smoke*.py
 /smoke*.log
 /run_log*.txt
@@ -142,15 +147,8 @@ $RECYCLE.BIN/
 /verify_*.py
 /0606.txt
 /debug.log
-/cprofile_*.log
-/cprofile_*.txt
-/cprofile_*.out
-/cprofile_*.json
-/v37_test_output.txt
-/_analyze_*.txt
-/_check_*.txt
-/_diag_*.txt
-/_test_*.txt
+/v3*_*.log
+/v3*_*.txt
 
 # ── 子目录里的 scratch/测试脚本（递归） ──
 **/_test_*.py
@@ -179,29 +177,9 @@ $RECYCLE.BIN/
 diagnostics/
 docs/
 
-# ── 根目录散落的报告（中文长篇报告默认不入仓，需要时手动 ! 取消） ──
-# 保留：README.md、.gitignore、requirements.txt、GPU_OPTIMIZATION_PLAN.md、
-#       M0全链路复权修复报告_20260420.md、M5_P2_UPGRADE_REPORT.md、
-#       P1_TRIAL_REUSE_EVALUATION2.md、PEP9_MOD_PLAN.md、
-#       m5_auto_shutdown_bug_report.md、m5_p2_modification_plan.md、
-#       tab4_design_and_usage_report.md、debug-m2-eval-oom.md、
-#       debug-pandas-oom-splitter.md
-# 其他根目录 *.md 一律忽略（避免误传个人手稿）
-/"*.md"
-!/README.md
-!/.gitignore
-!/GPU_OPTIMIZATION_PLAN.md
-!/"M0全链路复权修复报告_20260420.md"
-!/M5_P2_UPGRADE_REPORT.md
-!/P1_TRIAL_REUSE_EVALUATION2.md
-!/PEP9_MOD_PLAN.md
-!/m5_auto_shutdown_bug_report.md
-!/m5_p2_modification_plan.md
-!/tab4_design_and_usage_report.md
-!/debug-m2-eval-oom.md
-!/debug-pandas-oom-splitter.md
-!/m2tsc.md
-!/m5tsc.md
+# ── 根目录散落的报告默认不入仓（保留 README/requirements/.gitignore） ──
+# 如果想跟踪某个 .md，用：git add -f 文件名.md
+# 或者临时加一行: !/目标文件名.md
 
 # 真正的入口脚本（取回覆盖上面的忽略）
 !/run_m0_full.py
