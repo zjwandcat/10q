@@ -1,0 +1,23 @@
+TTHH A 股量化选股系统 (m01245)
+Copyright 2026 zjwandcat
+
+本产品包含第三方依赖，许可证信息如下：
+
+- pandas (BSD-3-Clause)
+- numpy (BSD-3-Clause)
+- lightgbm (MIT)
+- xgboost (Apache-2.0)
+- optuna (Apache-2.0)
+- gradio (Apache-2.0)
+- tushare (BSD-3-Clause)
+- scipy (BSD-3-Clause)
+- pyarrow (Apache-2.0)
+- pyyaml (MIT)
+- bottleneck (BSD-2-Clause)
+- shap (MIT)
+- psutil (BSD-3-Clause)
+- joblib (BSD-3-Clause)
+- pynvml (BSD-3-Clause)
+- matplotlib (PSF/BSD-Compatible)
+
+完整许可证文本可在各依赖的源代码仓库中查阅。
