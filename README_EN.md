@@ -64,35 +64,7 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 ---
 
-## 🌍 How to Make This Repository Public?
 
-**Option 1: GitHub Web UI (Recommended)**
-
-1. Open https://github.com/zjwandcat/10q
-2. Click **⚙️ Settings** in the top navigation
-3. Scroll to the bottom of the left sidebar → **Danger Zone** section
-4. Click **Change repository visibility** → **Make public**
-5. Type the repository name `10q` in the confirmation dialog → wait 1-2 minutes
-
-**Option 2: GitHub Mobile App**
-
-1. Open the repository → tap **⋯** in the top-right corner → **Settings**
-2. **General** → **Visibility** → switch to **Public**
-
-**Option 3: GitHub API (Command Line)**
-
-```bash
-curl -X PATCH \
-  -H "Authorization: Bearer <YOUR_PAT>" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/zjwandcat/10q \
-  -d '{"visibility":"public","private":false}'
-```
-
-> ✅ No need to re-push after making the repo public — all commits, branches, and tags become visible to everyone automatically.
-> ⚠️ Before making the repo public, double-check that `.gitignore` is correctly excluding `data/`, `logs/`, `*.pkl`, `*.parquet`, `*.db`, and `.env` (sensitive / large files).
-
----
 
 ## 1. System Overview
 
