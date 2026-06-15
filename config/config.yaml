@@ -1,0 +1,120 @@
+backtest:
+  benchmark: 000906.SH
+  end_date: '20251231'
+  start_date: '20070101'
+data:
+  index_dir: data/index/
+  neutralization:
+    active_scheme: scheme_d
+    available_schemes:
+      scheme_a: 双重OLS正交化（机构标准版）
+      scheme_b: Rank-Z+双重OLS（推荐，抗极端值）
+      scheme_d: 仅行业OLS（对照组）
+      scheme_e: 分层中性化（行业内Rank+全截面市值OLS）
+      scheme_b1: 非线性市值OLS（B基础 + ln(M)^2 + ln(M)^3，截面 demean 防御高阶共线性）
+      scheme_b2: WLS 加权（sqrt(mktcap) 对角权重，缺 mktcap 内部退化为等权 OLS）
+      scheme_f: 风格因子剥离（B基础 + 动量/换手/波动率 等 Barra 风格，缺列 raise）
+      scheme_g: PCA 隐式风险（60 天 log-return 矩阵纯 NumPy SVD，缺矩阵 raise）
+    params:
+      scheme_b1:
+        mktcap_degree: 3
+        demean_log_mktcap: true
+      scheme_b2:
+        weight: sqrt_mktcap
+        nan_to_zero: true
+      scheme_f:
+        style_factors:
+        - momentum_return_20d
+        - momentum_return_60d
+        - volatility_20d
+        - volatility_60d
+        - liquidity_turnover_20d
+        - liquidity_turnover_60d
+      scheme_g:
+        lookback_days: 60
+        n_components: 5
+        alignment: drop
+  pool_dirs:
+    scheme_a: data/pool_v2_scheme_a/
+    scheme_b: data/pool_v2_scheme_b/
+    scheme_d: data/pool_v2_scheme_d/
+    scheme_e: data/pool_v2_scheme_e/
+    scheme_b1: data/pool_v2_scheme_b1/
+    scheme_b2: data/pool_v2_scheme_b2/
+    scheme_f: data/pool_v2_scheme_f/
+    scheme_g: data/pool_v2_scheme_g/
+  raw_cache_dir: data/raw_cache/
+  stock_filter:
+    exclude_st: true
+    market_cap_max: 3000
+    market_cap_min: 100
+    max_suspend_days: 5
+    min_listed_days: 252
+    min_price: 2.0
+    turnover_rate_max: 0.15
+    turnover_rate_min: 0.01
+m2:
+  ensemble:
+    ic_penalize_threshold: 0.15
+    lgbm_weight: 0.5
+  feature_store:
+    max_corr: 0.95
+    min_ic_abs: 0.003
+    min_keep_factors: 50
+    min_valid_rate: 0.3
+  lgbm:
+    colsample_bytree: 0.3
+    learning_rate: 0.05
+    max_depth: 4
+    min_split_gain: 0.01
+    n_estimators: 300
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+  xgb:
+    colsample_bytree: 0.3
+    gamma: 0.01
+    learning_rate: 0.05
+    max_depth: 4
+    n_estimators: 300
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+m5:
+  gradio:
+    server_name: 127.0.0.1
+    server_port: 7860
+  optimization:
+    fast_mode: false
+    fast_window_count: 60
+    full_window_count: 173
+    gpu_mode: true
+    gpu_strategy: D
+    n_jobs: 1
+    phase1_trials: 50
+    phase2_trials: 30
+    seed: 42
+  output:
+    logs_dir: logs/m5/
+    results_dir: output/m5/
+performance:
+  benchmark: 000906.SH
+  benchmark_name: 中证800
+  max_drawdown: 0.35
+  min_calmar: 1.0
+  min_ir: 0.5
+  risk_free_rate: 0.03
+portfolio:
+  cost:
+    commission: 0.0003
+    slippage: 0.001
+    stamp_duty: 0.001
+  next5_weight: 0.07
+  top5_weight: 0.13
+rolling:
+  step_months: 1
+  test_months: 1
+  train_months: 36
+  valid_months: 12
+# Tushare token 不要再写在这里！从环境变量 TUSHARE_TOKEN 读取
+# 设置方法（PowerShell）：$env:TUSHARE_TOKEN = "你的token"
+tushare:
+  token: ""

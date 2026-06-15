@@ -1,0 +1,227 @@
+# =============================================================================
+# TTHH 量化系统 .gitignore
+# =============================================================================
+# 数据文件、运行产物、scratch 脚本一律不进入版本控制
+# 真正提交的只有：源代码、配置（脱敏）、文档、入口脚本、bat 启动器
+# =============================================================================
+
+# ─── 1. 数据与运行产物（大文件/二进制） ─────────────────────────────────────
+data/
+logs/
+output/
+
+# 通用大文件/二进制后缀（兜底）
+*.pkl
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.zip
+*.tar
+*.gz
+*.bz2
+*.7z
+*.rar
+*.dmg
+*.iso
+*.bin
+*.so
+*.dll
+*.pyd
+*.egg-info/
+
+# 数据库与日志
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.log.*
+*.out
+*.err
+nohup.out
+
+# CSV/JSON 运行结果（太大且可能含敏感中间量）
+output/**/*.csv
+output/**/*.json
+output/**/*.html
+output/**/*.htm
+output/**/*.xml
+
+# 报告/交接文档（个人手稿，不入仓）
+# 注意：根目录的 *.md 报告默认保留，特定大文件可手动 ! 取消忽略
+# output/TTHH_代码地图_v1.md
+# output/p1 skill.md
+
+# ─── 2. 环境与密钥 ──────────────────────────────────────────────────────────
+.env
+.env.*
+*.env.local
+config/config.local.yaml
+config/config.local.yml
+config/secrets.yaml
+config/secrets.yml
+config/credentials.json
+config/.tushare_token
+
+# 备份文件
+*.bak
+*.swp
+*.swo
+*.tmp
+*~
+.~*
+
+# ─── 3. Python 缓存与构建产物 ──────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.eggs/
+pip-log.txt
+
+# ─── 4. IDE / 编辑器 / 工具链 ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Trae / CodeArts / 内部工具
+.arts/
+.dbg/
+.trae/
+.codeartsdoer/
+
+# ─── 5. 项目内 scratch / 诊断脚本（一次性，不入仓） ─────────────────────────
+# 根目录的 _xxx.py / bench_*.py / profile_*.py / cprofile_*.py /
+# smoke_*.py / _check*.py / _diag*.py / _analyze_*.py / _test_*.py /
+# _validate_*.py / _run_*.py / _monitor_*.py / _bad_files_*.json /
+# _delete_*.py / _unify_*.py / _generate_*.py / _deep_*.py 一律忽略
+# 真正的入口脚本 run_m0_full.py / run_m2_m4.py / run_one_full.py 用 ! 取回
+
+# ── 根目录一次性脚本 ──
+/_*.py
+/bench*.py
+/bench*.txt
+/benchmark*.py
+/benchmark_v42_*.json
+/profile*.py
+/cprofile*.py
+/cprofile*.log
+/smoke*.py
+/smoke*.log
+/run_log*.txt
+/check*.py
+/diag*.py
+/analyze_*.py
+/investigate_*.py
+/compare_*.py
+/gen_*.py
+/generate_*.py
+/test_*.py
+/test_*.csv
+/test_*.parquet
+/verify_*.py
+/0606.txt
+/debug.log
+/cprofile_*.log
+/cprofile_*.txt
+/cprofile_*.out
+/cprofile_*.json
+/v37_test_output.txt
+/_analyze_*.txt
+/_check_*.txt
+/_diag_*.txt
+/_test_*.txt
+
+# ── 子目录里的 scratch/测试脚本（递归） ──
+**/_test_*.py
+**/_check_*.py
+**/_diag_*.py
+**/_analyze_*.py
+**/_validate_*.py
+**/_run_*.py
+**/_monitor_*.py
+**/_delete_*.py
+**/_unify_*.py
+**/_generate_*.py
+**/_deep_*.py
+**/_bad_files_*.json
+**/bench_*.py
+**/bench_*.txt
+**/benchmark_*.py
+**/benchmark_*.json
+**/profile_*.py
+**/cprofile_*.py
+**/cprofile_*.log
+**/smoke_*.py
+**/smoke_*.log
+
+# ── 诊断/方案文档目录（生成的报告，不入仓） ──
+diagnostics/
+docs/
+
+# ── 根目录散落的报告（中文长篇报告默认不入仓，需要时手动 ! 取消） ──
+# 保留：README.md、.gitignore、requirements.txt、GPU_OPTIMIZATION_PLAN.md、
+#       M0全链路复权修复报告_20260420.md、M5_P2_UPGRADE_REPORT.md、
+#       P1_TRIAL_REUSE_EVALUATION2.md、PEP9_MOD_PLAN.md、
+#       m5_auto_shutdown_bug_report.md、m5_p2_modification_plan.md、
+#       tab4_design_and_usage_report.md、debug-m2-eval-oom.md、
+#       debug-pandas-oom-splitter.md
+# 其他根目录 *.md 一律忽略（避免误传个人手稿）
+/"*.md"
+!/README.md
+!/.gitignore
+!/GPU_OPTIMIZATION_PLAN.md
+!/"M0全链路复权修复报告_20260420.md"
+!/M5_P2_UPGRADE_REPORT.md
+!/P1_TRIAL_REUSE_EVALUATION2.md
+!/PEP9_MOD_PLAN.md
+!/m5_auto_shutdown_bug_report.md
+!/m5_p2_modification_plan.md
+!/tab4_design_and_usage_report.md
+!/debug-m2-eval-oom.md
+!/debug-pandas-oom-splitter.md
+!/m2tsc.md
+!/m5tsc.md
+
+# 真正的入口脚本（取回覆盖上面的忽略）
+!/run_m0_full.py
+!/run_m2_m4.py
+!/run_one_full.py
+!/p1_report_generator.py
+!/analyze_m5_p1.py
+
+# ─── 6. Jupyter / Notebook ──────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── 7. Windows 特定 ─────────────────────────────────────────────────────────
+*.lnk
+*.url
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ─── 8. 其他 ────────────────────────────────────────────────────────────────
+*.bak_*
+*.orig
+*.rej
+.mcp_config*
