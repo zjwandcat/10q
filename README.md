@@ -64,35 +64,6 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 ---
 
-## 🌍 如何把本仓库公开？
-
-**方式一：GitHub 网页（推荐）**
-
-1. 打开 https://github.com/zjwandcat/10q
-2. 顶栏点击 **⚙️ Settings**
-3. 左侧栏最底部 → **Danger Zone** 区域
-4. 点击 **Change repository visibility** → **Make public**
-5. 在弹窗中输入仓库名 `10q` 确认 → 等待 1-2 分钟
-
-**方式二：GitHub Mobile**
-
-1. 打开仓库 → 右上角 **⋯** → **Settings**
-2. **General** → **Visibility** → 切换为 **Public**
-
-**方式三：GitHub API（命令行）**
-
-```bash
-curl -X PATCH \
-  -H "Authorization: Bearer <YOUR_PAT>" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/zjwandcat/10q \
-  -d '{"visibility":"public","private":false}'
-```
-
-> ✅ 公开后无需重新 push，所有 commit、branch、tag 都会自动对所有人可见。
-> ⚠️ 公开前请再次确认 `.gitignore` 已正确排除 `data/`、`logs/`、`*.pkl`、`*.parquet`、`*.db`、`.env` 等敏感/大文件。
-
----
 
 ## 一、系统总览
 
