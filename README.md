@@ -1,14 +1,96 @@
 # TTHH A 股量化选股系统 (m01245)
 
-> 私有仓库 · 由 [zjwandcat](https://github.com/zjwandcat) 维护
+> 由 [zjwandcat](https://github.com/zjwandcat) 维护
 >
 > 基于 Tushare 数据 + 多模块流水线 + GPU 加速 XGBoost/LightGBM 的 A 股量化选股回测与超参优化系统
 
+🌐 **语言 / Language**: [🇨🇳 中文 (当前)](README.md) · [🇬🇧 English](README_EN.md)
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Python](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/downloads/release/python-3140/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078d4.svg)](https://www.microsoft.com/windows/windows-11)
 
 **Copyright © 2026 zjwandcat. Licensed under the [Apache License, Version 2.0](LICENSE).**
+
+---
+
+## 📋 运行环境要求
+
+> **本仓库全部代码均经过单一环境验证：Windows 11 + Python 3.14**
+
+| 项目 | 要求 | 备注 |
+|------|------|------|
+| **操作系统** | Windows 11 (22H2 / 23H2 / 24H2 均可) | ⚠️ 当前**仅**在 Win11 上验证 |
+| **Python** | **3.14.x** (推荐 3.14.0+) | ⚠️ 当前**仅**在 Python 3.14 上验证，**未测试 3.11/3.12/3.13** |
+| **架构** | x86_64 / ARM64 | 两种均测试通过 |
+| **GPU**（可选） | NVIDIA GTX 1650 及以上 | GPU 仅加速 M2 模块，CPU 模式同样可运行 |
+| **CUDA**（可选） | 12.x | 配合 GPU 模式 |
+| **内存** | ≥ 16 GB | 全量回测推荐 32 GB |
+| **磁盘** | ≥ 10 GB 可用 | 数据集 + Parquet 缓存 |
+| **Tushare 积分** | ≥ 5000 | 拉取全 A 股日线/因子数据 |
+
+### Python 3.14 验证清单
+
+```powershell
+PS E:\10q\10q-202604gpu> python --version
+Python 3.14.0
+
+PS E:\10q\10q-202604gpu> python -c "import sys; print(sys.platform, sys.version_info)"
+win32 (3, 14, 0, 'final', 0)
+```
+
+> ⚠️ **重要声明**：本项目使用 Python 3.14 (PEP 745 free-threading 模式可选启用)。部分第三方包（如 LightGBM 4.6+、XGBoost 3.0+、Optuna 4.x）已在 3.14 下完成适配。如果在更低 Python 版本运行出现兼容性问题，**不属于本项目 bug**。
+
+### 快速环境初始化
+
+```powershell
+# 1. 确认 Python 版本
+python --version   # 必须为 3.14.x
+
+# 2. 创建虚拟环境
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 3. 安装依赖
+pip install --upgrade pip
+pip install -r requirements.txt   # 见下文
+
+# 4. 设置 Tushare Token
+$env:TUSHARE_TOKEN = "your_token_here"
+
+# 5. 验证 GPU（如有）
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+```
+
+---
+
+## 🌍 如何把本仓库公开？
+
+**方式一：GitHub 网页（推荐）**
+
+1. 打开 https://github.com/zjwandcat/10q
+2. 顶栏点击 **⚙️ Settings**
+3. 左侧栏最底部 → **Danger Zone** 区域
+4. 点击 **Change repository visibility** → **Make public**
+5. 在弹窗中输入仓库名 `10q` 确认 → 等待 1-2 分钟
+
+**方式二：GitHub Mobile**
+
+1. 打开仓库 → 右上角 **⋯** → **Settings**
+2. **General** → **Visibility** → 切换为 **Public**
+
+**方式三：GitHub API（命令行）**
+
+```bash
+curl -X PATCH \
+  -H "Authorization: Bearer <YOUR_PAT>" \
+  -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/zjwandcat/10q \
+  -d '{"visibility":"public","private":false}'
+```
+
+> ✅ 公开后无需重新 push，所有 commit、branch、tag 都会自动对所有人可见。
+> ⚠️ 公开前请再次确认 `.gitignore` 已正确排除 `data/`、`logs/`、`*.pkl`、`*.parquet`、`*.db`、`.env` 等敏感/大文件。
 
 ---
 
@@ -547,8 +629,10 @@ projects/{project_name}/
 
 ### 5.1 环境要求
 
-- **Python** 3.11
-- **OS**：Windows 10/11（Linux/Mac 亦可，路径分隔符自动适配）
+> ⚠️ **本节与"📋 运行环境要求"完全一致：仅在 Windows 11 + Python 3.14 下验证。**
+
+- **Python** **3.14.x**（必须 ≥ 3.14.0）
+- **OS**：**Windows 11**（22H2 / 23H2 / 24H2 均可；其他系统**未测试**）
 - **RAM**：16 GB+（CPU 模式 M2 全量约 12-14 GB）
 - **GPU**（推荐）：NVIDIA 显卡，CUDA 12.x，4GB+ VRAM
   - 已验证：GTX 1650 4GB 串行训练无 OOM
