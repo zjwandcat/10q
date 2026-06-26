@@ -33,7 +33,13 @@ def _load_config() -> dict:
 
 
 def _load_benchmark() -> pd.DataFrame:
-    """加载中证800基准数据"""
+    """加载中证800基准数据
+
+    配套 _calc_benchmark_returns_point_to_point：
+    month m 的基准 = month m 月末 close → month m+1 月末 close 的点对点收益。
+    这样和 M0 中 Target_Return_1M 的"month m 月末 → month m+1 月末"语义一致，
+    避免 pred_month=m 的策略（下月收益）和基准（本月收益）错位一个月。
+    """
     p = Path("data/benchmark_000906.parquet")
     if not p.exists():
         logger.warning("未找到 data/benchmark_000906.parquet")
@@ -41,6 +47,46 @@ def _load_benchmark() -> pd.DataFrame:
     df = pd.read_parquet(p)
     logger.info(f"已加载基准数据: {len(df)}行")
     return df
+
+
+def _calc_benchmark_returns_point_to_point(
+    benchmark_df: pd.DataFrame,
+) -> pd.Series:
+    """
+    点对点（point-to-point）月度收益计算。
+
+    month m 的 return = (month m+1 月末close / month m 月末close) - 1
+
+    与 M0 pipeline.py 里 Target_Return_1M 的定义完全一致：
+    M0 用 yyyymm 月最后一个交易日 → yyyymm+1 月最后一个交易日的复权价收益
+    作为 month yyyymm 截面对应的 forward 1M return。
+
+    修复前 bug（first_close / last_close）：
+        month m 的 return = (month m 月内last_close / month m 月内first_close) - 1
+        也就是"month m 月内"收益，与策略"month m 月末 → month m+1 月末"语义不一致，
+        导致净值曲线整体提前一个月（策略波峰对应上个月基准的波谷）。
+    """
+    if benchmark_df is None or benchmark_df.empty:
+        return pd.Series(dtype=float)
+    df = benchmark_df.copy()
+    if "date" not in df.columns or "close" not in df.columns:
+        logger.warning("benchmark_df 缺 date/close 列，返回空 Series")
+        return pd.Series(dtype=float)
+    df["date"] = df["date"].astype(str)
+    df["year_month"] = df["date"].str[:6]
+
+    # 每月最后一个交易日 close
+    monthly_last = (
+        df.sort_values("date")
+        .groupby("year_month")
+        .agg(last_close=("close", "last"))
+    )
+    # 下月最后交易日 close（最后一个月的下月为 NaN，return 也是 NaN）
+    monthly_last["next_last_close"] = monthly_last["last_close"].shift(-1)
+    monthly_last["return"] = (
+        monthly_last["next_last_close"] / monthly_last["last_close"] - 1
+    )
+    return monthly_last["return"]
 
 
 def _compute_jensen_appraisal_full(
@@ -64,11 +110,11 @@ def _compute_jensen_appraisal_full(
         - NaN / Inf 输入或输出   → 0.0
     """
     if len(monthly) < 12:
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
     if "portfolio_return" not in monthly.columns or \
        "benchmark_return" not in monthly.columns:
         logger.warning("monthly 缺少 portfolio_return / benchmark_return 列")
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
 
     rf_monthly = rf_annual / 12.0
     rets = monthly["portfolio_return"].to_numpy(dtype=np.float64)
@@ -78,32 +124,33 @@ def _compute_jensen_appraisal_full(
     x = bms  - rf_monthly
 
     if np.unique(x).size < 2:
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
 
     x_mean = float(x.mean())
     y_mean = float(y.mean())
     ss_xx  = float(((x - x_mean) ** 2).sum())
     if ss_xx < 1e-12:
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
 
     beta  = float(((x - x_mean) * (y - y_mean)).sum() / ss_xx)
     alpha = y_mean - beta * x_mean
 
     residuals = y - (alpha + beta * x)
     if residuals.size < 2:
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
 
     sigma_eps = float(residuals.std(ddof=1))
 
     jensen_alpha    = alpha * 12.0
     appraisal_ratio = (alpha / sigma_eps) if sigma_eps > 1e-8 else 0.0
 
-    if not (np.isfinite(jensen_alpha) and np.isfinite(appraisal_ratio)):
-        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0}
+    if not (np.isfinite(jensen_alpha) and np.isfinite(appraisal_ratio) and np.isfinite(beta)):
+        return {"jensen_alpha": 0.0, "appraisal_ratio": 0.0, "beta": 0.0}
 
     return {
         "jensen_alpha":    round(float(jensen_alpha),    6),
         "appraisal_ratio": round(float(appraisal_ratio), 6),
+        "beta":            round(float(beta),            6),
     }
 
 
@@ -145,9 +192,12 @@ class PerformanceMetrics:
         """
         logger.info("开始计算月度收益...")
 
-        # 只取is_holding=True的持仓
-        holdings = all_portfolios[
-            all_portfolios["is_holding"] == True].copy()
+        if "is_holding" in all_portfolios.columns:
+            holdings = all_portfolios[
+                all_portfolios["is_holding"] == True].copy()
+        else:
+            holdings = all_portfolios[
+                all_portfolios["stock_code"] != "CASH_POOL"].copy()
         logger.info(f"  筛选持仓: {len(holdings)}行")
 
         # 处理收益缺失
@@ -172,24 +222,22 @@ class PerformanceMetrics:
             .reset_index()
         )
 
-        # 计算换手成本
+        # ★ 优化: 用 groupby 一次性构建所有月份持仓字典, 替代逐月循环过滤
+        # 原: for m in months: holdings[holdings["pred_month"] == m] (O(N×M) 全表扫描)
+        # 新: 1 次 groupby + dict 构建 (O(M) 一次扫描)
         from m2_engine.portfolio_builder import calculate_turnover_cost
+        monthly_holdings = (
+            holdings.groupby("pred_month")
+            .apply(lambda g: dict(zip(g["stock_code"], g["weight"])))
+            .to_dict()
+        )
+
+        # ★ 优化: 删除冗余 is_holding 检查
+        # 原因: 第149行已确保所有记录 is_holding == True, 第187-192行的检查永远不会过滤掉任何记录
         prev_holdings = {}
         turnover_costs = []
-        months_sorted = sorted(monthly["pred_month"].tolist())
-        for m in months_sorted:
-            month_holdings_df = holdings[holdings["pred_month"] == m]
-            curr_holdings = dict(zip(
-                month_holdings_df["stock_code"],
-                month_holdings_df["weight"]
-            ))
-            # 只保留is_holding的
-            curr_holdings = {
-                s: w for s, w in curr_holdings.items()
-                if month_holdings_df[
-                    month_holdings_df["stock_code"] == s
-                ]["is_holding"].iloc[0]
-            }
+        for m in sorted(monthly["pred_month"].tolist()):
+            curr_holdings = monthly_holdings[m]  # O(1) 字典查找
             if prev_holdings:
                 cost = calculate_turnover_cost(
                     prev_holdings, curr_holdings,
@@ -209,14 +257,19 @@ class PerformanceMetrics:
             monthly["portfolio_return"] - monthly["turnover_cost"]
         )
 
-        # 计算真实基准收益率（中证800）
+        # ★ 修复: 改用"点对点"算法计算基准月度收益
+        #   month m 的基准 = (month m+1 月末close / month m 月末close) - 1
+        #   与 M0 pipeline.py 中 Target_Return_1M 的定义严格对齐：
+        #   M0 用 yyyymm 月最后交易日 → yyyymm+1 月最后交易日的复权价作为 month yyyymm
+        #   截面对应的 forward 1M return。原 M4 用"月内首末 close"导致策略曲线早基准一个月。
         benchmark_df = _load_benchmark()
         if not benchmark_df.empty and len(monthly) > 0:
-            benchmark_df['date'] = benchmark_df['date'].astype(str)
-            monthly['benchmark_return'] = monthly['pred_month'].apply(
-                lambda m: self._calc_benchmark_return(benchmark_df, m)
+            bench_returns = _calc_benchmark_returns_point_to_point(
+                benchmark_df)
+            monthly['benchmark_return'] = (
+                monthly['pred_month'].map(bench_returns).fillna(0.0)
             )
-            logger.info("  使用真实基准数据（中证800）")
+            logger.info("  使用真实基准数据（中证800，点对点法）")
         else:
             monthly['benchmark_return'] = 0.0
             logger.warning("  未找到基准数据，使用默认值0")
@@ -230,29 +283,6 @@ class PerformanceMetrics:
         logger.info(
             f"  月度收益计算完成: {len(monthly)}个月")
         return monthly
-
-    @staticmethod
-    def _calc_benchmark_return(benchmark_df: pd.DataFrame, month: str) -> float:
-        """计算某月的基准收益率"""
-        try:
-            year = int(str(month)[:4])
-            month_num = int(str(month)[4:])
-            
-            # 找到该月第一个和最后一个交易日
-            month_data = benchmark_df[
-                (benchmark_df['date'].str[:6] == f"{year}{month_num:02d}")
-            ].sort_values('date')
-            
-            if len(month_data) < 2:
-                return 0.0
-            
-            first_close = month_data.iloc[0]['close']
-            last_close = month_data.iloc[-1]['close']
-            
-            return (last_close - first_close) / first_close
-        except Exception as e:
-            logger.debug(f"计算基准收益失败 {month}: {e}")
-            return 0.0
 
     def calculate(
         self,
@@ -343,6 +373,19 @@ class PerformanceMetrics:
         if roll6_excess:
             roll6_win = float(np.mean(np.array(roll6_excess) > 0))
 
+        # 滚动6月IR（与M2 ensemble.py同公式：6月窗口IR均值，ddof=1）
+        rolling6m_ir = 0.0
+        if n >= 6:
+            from numpy.lib.stride_tricks import sliding_window_view
+            win_ex = sliding_window_view(ex, 6)
+            win_ex_mean = win_ex.mean(axis=1)
+            win_ex_std = win_ex.std(axis=1, ddof=1)
+            irs = np.where(
+                win_ex_std > 1e-8,
+                win_ex_mean / np.where(win_ex_std > 1e-8, win_ex_std, 1.0) * np.sqrt(12),
+                0.0)
+            rolling6m_ir = float(np.mean(irs))
+
         # ★ 换手成本指标
         turnover_costs = monthly["turnover_cost"].values if "turnover_cost" in monthly.columns else np.zeros(n)
         avg_monthly_turnover_cost = float(np.mean(turnover_costs))
@@ -355,6 +398,10 @@ class PerformanceMetrics:
 
         # ★ Jensen's Alpha & Appraisal Ratio（全期 OLS）
         _ja = _compute_jensen_appraisal_full(monthly, rf_annual=self.rf)
+
+        # ★ SQN (System Quality Number): mean(r)/std(r)*sqrt(n)
+        r_std = float(np.std(r, ddof=1))
+        sqn = (float(np.mean(r)) / r_std * np.sqrt(n)) if r_std > 1e-8 and n > 1 else 0.0
 
         metrics = {
             "cagr": round(cagr, 6),
@@ -385,12 +432,15 @@ class PerformanceMetrics:
             "burke_ratio": round(burke, 6),
             "martin_ratio": round(martin, 6),
             "rolling6m_win_rate": round(roll6_win, 6),
+            "rolling6m_ir": round(rolling6m_ir, 6),
             "n_months": n,
             "avg_monthly_turnover_cost": round(avg_monthly_turnover_cost, 6),
             "avg_annual_turnover_cost": round(avg_annual_turnover_cost, 6),
             "net_cagr_after_cost": round(net_cagr, 6),
             "jensen_alpha":    _ja["jensen_alpha"],
             "appraisal_ratio": _ja["appraisal_ratio"],
+            "beta":            _ja["beta"],
+            "sqn":             round(sqn, 6),
         }
         logger.info(
             f"  绩效指标计算完成: CAGR={cagr:.2%}, "
@@ -413,3 +463,57 @@ class PerformanceMetrics:
         }
         checks["all_pass"] = all(checks.values())
         return checks
+
+    # ──────────────────────────────────────────────────
+    #  归因（Brinson / 五因子 / Barra）
+    # ──────────────────────────────────────────────────
+    def run_attribution(
+        self,
+        all_portfolios: pd.DataFrame,
+        monthly: pd.DataFrame,
+        factor_df: pd.DataFrame = None,
+    ) -> Dict:
+        """
+        对外统一入口：M4 报告需要的所有归因数据。
+        返回:
+            {
+              'holdings':     DataFrame,  is_holding 子集 + 行业
+              'brinson':      DataFrame,
+              'five_factor':  DataFrame,
+              'barra':        DataFrame,
+              'shap_bundle':  dict,      {pred_month: (sv, sf, source)}
+            }
+        """
+        from .attribution import run_attribution
+
+        if "is_holding" in all_portfolios.columns:
+            holdings = all_portfolios[
+                all_portfolios["is_holding"] == True
+            ].copy()
+        else:
+            holdings = all_portfolios[
+                all_portfolios["stock_code"] != "CASH_POOL"
+            ].copy()
+        # ★ 改造: 优先从 all_portfolios.attrs 读完整 SHAP（M2 挂的）；
+        #   退化用 shap_top1/2/3 列做粗略聚合
+        shap_bundle: Dict = {}
+        full_shap = all_portfolios.attrs.get("shap_data", None)
+        if full_shap:
+            shap_bundle = full_shap
+        elif "shap_top1_factor" in holdings.columns:
+            for m, g in holdings.groupby("pred_month"):
+                cols = [c for c in [
+                    "shap_top1_value", "shap_top2_value",
+                    "shap_top3_value"] if c in g.columns]
+                if cols:
+                    shap_bundle[str(m)] = g[cols].to_numpy()
+
+        attr = run_attribution(
+            holdings=holdings,
+            monthly=monthly,
+            factor_df=factor_df,
+            rf_annual=self.rf,
+        )
+        attr["holdings"]    = holdings
+        attr["shap_bundle"] = shap_bundle
+        return attr
