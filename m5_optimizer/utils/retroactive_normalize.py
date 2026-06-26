@@ -134,59 +134,57 @@ def retroactively_normalize_study(
     # 直接操作 SQLite 写入 target_key
     if trial_scores:
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
 
-            # 获取 study_id
-            cursor.execute(
-                "SELECT study_id FROM studies WHERE study_name = ?",
-                (study_name,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                logger.error(f"Study '{study_name}' 不存在于数据库中")
-                conn.close()
-                return {"total": total, "processed": 0, "skipped": skipped, "errors": errors + 1}
-
-            study_id = row[0]
-
-            # 获取所有 trial_id 和 number 的映射
-            cursor.execute(
-                "SELECT trial_id, number FROM trials WHERE study_id = ?",
-                (study_id,),
-            )
-            trial_id_map = {row[1]: row[0] for row in cursor.fetchall()}
-
-            # 写入 target_key 到 trial_user_attributes 表
-            for trial_number, norm_score in trial_scores.items():
-                trial_id = trial_id_map.get(trial_number)
-                if trial_id is None:
-                    continue
-
-                # 检查是否已存在
+                # 获取 study_id
                 cursor.execute(
-                    "SELECT COUNT(*) FROM trial_user_attributes "
-                    "WHERE trial_id = ? AND key = ?",
-                    (trial_id, target_key),
+                    "SELECT study_id FROM studies WHERE study_name = ?",
+                    (study_name,),
                 )
-                exists = cursor.fetchone()[0] > 0
+                row = cursor.fetchone()
+                if row is None:
+                    logger.error(f"Study '{study_name}' 不存在于数据库中")
+                    return {"total": total, "processed": 0, "skipped": skipped, "errors": errors + 1}
 
-                if exists:
+                study_id = row[0]
+
+                # 获取所有 trial_id 和 number 的映射
+                cursor.execute(
+                    "SELECT trial_id, number FROM trials WHERE study_id = ?",
+                    (study_id,),
+                )
+                trial_id_map = {row[1]: row[0] for row in cursor.fetchall()}
+
+                # 写入 target_key 到 trial_user_attributes 表
+                for trial_number, norm_score in trial_scores.items():
+                    trial_id = trial_id_map.get(trial_number)
+                    if trial_id is None:
+                        continue
+
+                    # 检查是否已存在
                     cursor.execute(
-                        "UPDATE trial_user_attributes SET value_json = ? "
+                        "SELECT COUNT(*) FROM trial_user_attributes "
                         "WHERE trial_id = ? AND key = ?",
-                        (json.dumps(norm_score), trial_id, target_key),
+                        (trial_id, target_key),
                     )
-                else:
-                    cursor.execute(
-                        "INSERT INTO trial_user_attributes (trial_id, key, value_json) "
-                        "VALUES (?, ?, ?)",
-                        (trial_id, target_key, json.dumps(norm_score)),
-                    )
-                processed += 1
+                    exists = cursor.fetchone()[0] > 0
 
-            conn.commit()
-            conn.close()
+                    if exists:
+                        cursor.execute(
+                            "UPDATE trial_user_attributes SET value_json = ? "
+                            "WHERE trial_id = ? AND key = ?",
+                            (json.dumps(norm_score), trial_id, target_key),
+                        )
+                    else:
+                        cursor.execute(
+                            "INSERT INTO trial_user_attributes (trial_id, key, value_json) "
+                            "VALUES (?, ?, ?)",
+                            (trial_id, target_key, json.dumps(norm_score)),
+                        )
+                    processed += 1
+
+                conn.commit()
             logger.info(f"SQLite 写入完成: {processed} 条 {target_key} 记录")
 
         except Exception as e:

@@ -95,15 +95,17 @@ def _default_p1_config(project_name: str) -> dict:
         "config": {
             "scheme": "scheme_d",
             "fast_mode": True,
-            "window_count": 60,  # fast_mode=True时的默认窗口数，实际运行时会被app.py覆盖
+            "window_count": 155,
             "objective_weights": {
-                "val_icir": 0.20,
-                "ic_gap_penalty": 0.25,
-                "pct_positive_excess": 0.20,
-                "val_rolling6m_ir": 0.20,
+                "val_icir": 0.18,
+                "ic_gap_penalty": 0.22,
+                "pct_positive_excess": 0.18,
+                "val_rolling6m_ir": 0.18,
                 "ir_worst_quartile": 0.05,
                 "val_ic": 0.05,
                 "penalized_rate": 0.05,
+                "cvar_95": 0.05,
+                "pain_index": 0.04,
             },
             "active_params": None,
             "param_ranges": {},
@@ -124,16 +126,17 @@ def _default_p2_config(project_name: str) -> dict:
         "study_name": "phase2_local",
         "config": {
             "scheme": "scheme_d",
-            "fast_mode": False,
-            "window_count": calc_window_count(),
+            "fast_mode": True,
             "objective_weights": {
-                "val_icir": 0.20,
-                "ic_gap_penalty": 0.25,
-                "pct_positive_excess": 0.20,
-                "val_rolling6m_ir": 0.20,
+                "val_icir": 0.18,
+                "ic_gap_penalty": 0.22,
+                "pct_positive_excess": 0.18,
+                "val_rolling6m_ir": 0.18,
                 "ir_worst_quartile": 0.05,
                 "val_ic": 0.05,
                 "penalized_rate": 0.05,
+                "cvar_95": 0.05,
+                "pain_index": 0.04,
             },
             "active_params": None,
             "param_ranges": {},
@@ -543,22 +546,15 @@ def reset_all(project: dict):
 def _ensure_wal(db_path: str):
     """开启SQLite WAL模式，提升读写性能和续跑稳定性"""
     import sqlite3
-    conn = None
     try:
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA cache_size=-64000;")  # 64MB缓存
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.commit()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA cache_size=-64000;")  # 64MB缓存
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.commit()
     except Exception:
         pass  # 不影响主流程
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def _ensure_wal_safe(db_path: str):
@@ -570,23 +566,16 @@ def _ensure_wal_safe(db_path: str):
     3. 适用于 Optuna study 创建/加载后调用（此时 SQLAlchemy 可能仍持有连接池）
     """
     import sqlite3
-    conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA cache_size=-64000;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        conn.commit()
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA cache_size=-64000;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
     except Exception:
         pass  # 不影响主流程
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def update_trials_history(project: dict, n_trials_this_run: int, phase: str = "p1"):
@@ -612,6 +601,7 @@ def cleanup_bad_trials(
     project: dict,
     phase: str = "p1",
     dry_run: bool = False,
+    skip_running: bool = False,
 ) -> dict:
     """
     清理 study 里的异常 Trial（直接操作 SQLite，绕过 Optuna API 限制）。
@@ -710,12 +700,21 @@ def cleanup_bad_trials(
         }
 
         # ── 2a. 状态异常 ──
+        # skip_running=True 用于 study 运行期间停止按钮，避免删除 RUNNING Trial
+        # 导致正在执行的 trial.set_user_attr() 抛 KeyError 引起 Phase1 崩溃
         if DETECTION_RULES["state_abnormal"]:
-            cursor.execute(
-                """SELECT trial_id, number, state FROM trials
-                   WHERE study_id=? AND state IN ('FAIL','RUNNING','WAITING')""",
-                (study_id,)
-            )
+            if skip_running:
+                cursor.execute(
+                    """SELECT trial_id, number, state FROM trials
+                       WHERE study_id=? AND state IN ('FAIL','WAITING')""",
+                    (study_id,)
+                )
+            else:
+                cursor.execute(
+                    """SELECT trial_id, number, state FROM trials
+                       WHERE study_id=? AND state IN ('FAIL','RUNNING','WAITING')""",
+                    (study_id,)
+                )
             for tid, tnum, state in cursor.fetchall():
                 if tid not in bad_id_set:
                     bad_trial_ids.append(tid)
@@ -1042,12 +1041,12 @@ def _empty_cleanup_result(message: str, dry_run: bool) -> dict:
 def _count_complete(conn, study_id: int) -> int:
     """统计 study 当前的 COMPLETE trial 数量（内部使用）"""
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) FROM trials WHERE study_id=? AND state='COMPLETE'",
-            (study_id,)
-        )
-        return cur.fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM trials WHERE study_id=? AND state='COMPLETE'",
+                (study_id,)
+            )
+            return cur.fetchone()[0]
     except Exception:
         return 0
 

@@ -260,6 +260,15 @@ OBJECTIVE_VARS: List[Dict[str, Any]] = [
     {"name": "val_beta", "source": "m2", "direction": "min", "enabled": True, "label": "Beta →1", "slider_min": 0.0, "slider_max": 2.0},
     # ★ P1 自适应型 2.0：仅保留 IC稳定性（std），与 IC信息比率（ICIR = mean/std）含义不同，不可互替
     {"name": "val_ic_stability", "source": "m2", "direction": "min", "enabled": True, "label": "IC稳定性 (std) →0", "slider_min": 0.0, "slider_max": 0.3},
+    {"name": "val_sqn", "source": "m2", "direction": "max", "enabled": True, "label": "SQN系统质量指数 ↑", "slider_min": 0.0, "slider_max": 5.0},
+    # ★ P1 自适应型 2.0：补齐 3 项被 M2 引擎产出但之前漏注册的因变量
+    #  - val_rolling6m_dir: 6 月滚动方向准确率（0~1，越高越好）
+    #  - val_ir_stability: IR 跨时间稳定性（std，越低越好）
+    #  - turnover_penalty: 日均双边换手率（越低越好，控制交易成本）
+    # 修复前: PRESET_TEMPLATES["自适应型 2.0"] 引用了这 3 项的权重但 UI 无对应滑块, 静默丢失
+    {"name": "val_rolling6m_dir", "source": "m2", "direction": "max", "enabled": True, "label": "6月滚动方向准确率 ↑", "slider_min": 0.0, "slider_max": 1.0},
+    {"name": "val_ir_stability",  "source": "m2", "direction": "min", "enabled": True, "label": "IR稳定性 (std) →0",   "slider_min": 0.0, "slider_max": 0.3},
+    {"name": "turnover_penalty",  "source": "m2", "direction": "min", "enabled": True, "label": "换手率惩罚 ↓",          "slider_min": 0.0, "slider_max": 1.0},
 
     {"name": "stress_2008_excess", "source": "m2", "direction": "max", "enabled": False, "label": "2008超额 ↑", "slider_min": -2.0, "slider_max": 2.0},
     {"name": "stress_2015_mdd", "source": "m2", "direction": "min", "enabled": False, "label": "2015最大回撤 ↓", "slider_min": -2.0, "slider_max": 2.0},
@@ -279,13 +288,25 @@ OBJECTIVE_VARS: List[Dict[str, Any]] = [
     {"name": "burke_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "伯克比率 ↑", "slider_min": -2.0, "slider_max": 2.0},
     {"name": "martin_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "马丁比率 ↑", "slider_min": -2.0, "slider_max": 2.0},
     {"name": "tail_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "尾部比率 ↑", "slider_min": 0.0, "slider_max": 3.0},
-    # ★ 捕获比三件套：用户决策 — 只看 up_capture_ratio（越大越好），
-    #   down_capture_ratio / capture_ratio 标记为 enabled=False，
-    #   不再进入 P1/P2 权重滑块，不再贡献到贝叶斯优化 score。
-    #   但仍写入 user_attrs，且 Top-5/Tab4 排名中作为信息继续显示。
+    # ★ Task 2: 激活 M4 独有核心指标 — 之前因 source=m4 无数据流, 一律置 0, 现已修复
+    {"name": "sharpe_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "夏普比率 ↑", "slider_min": 0.0, "slider_max": 3.0},
+    {"name": "sortino_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "索提诺比率 ↑", "slider_min": 0.0, "slider_max": 3.0},
+    {"name": "calmar_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "Calmar比率 ↑", "slider_min": -1.0, "slider_max": 3.0},
+    {"name": "max_drawdown", "source": "m4", "direction": "min", "enabled": True, "label": "最大回撤 ↓", "slider_min": -0.5, "slider_max": 0.0},
+    {"name": "ir", "source": "m4", "direction": "max", "enabled": True, "label": "信息比率 (M4口径) ↑", "slider_min": -1.0, "slider_max": 2.0},
+    {"name": "net_cagr_after_cost", "source": "m4", "direction": "max", "enabled": True, "label": "扣费后净CAGR ↑", "slider_min": -0.3, "slider_max": 0.5},
+    {"name": "annual_excess", "source": "m4", "direction": "max", "enabled": True, "label": "年化超额收益 ↑", "slider_min": -0.3, "slider_max": 0.3},
+    {"name": "ulcer_index", "source": "m4", "direction": "min", "enabled": True, "label": "Ulcer指数 ↓", "slider_min": 0.0, "slider_max": 0.5},
+    {"name": "sterling_ratio", "source": "m4", "direction": "max", "enabled": True, "label": "Sterling比率 ↑", "slider_min": -2.0, "slider_max": 3.0},
+    {"name": "rolling6m_win_rate", "source": "m4", "direction": "max", "enabled": True, "label": "滚动6月胜率 ↑", "slider_min": 0.0, "slider_max": 1.0},
+    {"name": "rolling6m_ir", "source": "m4", "direction": "max", "enabled": True, "label": "滚动6月IR (M4口径) ↑", "slider_min": -1.0, "slider_max": 2.0},
+    # ★ 捕获比三件套: 现已统一从 M4 拉取 (扣费后), 数据精准
+    #   down_capture_ratio / capture_ratio 标记为 enabled=False,
+    #   不再进入 P1/P2 权重滑块, 不再贡献到贝叶斯优化 score。
+    #   但仍写入 user_attrs, 且 Top-5/Tab4 排名中作为信息继续显示。
     {"name": "up_capture_ratio", "source": "m4", "direction": "max", "enabled": True,  "label": "上行捕获比 ↑",   "slider_min": 0.0, "slider_max": 2.0},
-    {"name": "down_capture_ratio", "source": "m4", "direction": "min", "enabled": False, "label": "下行捕获比 ↓（已禁用）", "slider_min": 0.0, "slider_max": 2.0},
-    {"name": "capture_ratio", "source": "m4", "direction": "max", "enabled": False, "label": "综合捕获比 ↑（已禁用）", "slider_min": -2.0, "slider_max": 2.0},
+    {"name": "down_capture_ratio", "source": "m4", "direction": "min", "enabled": False, "label": "下行捕获比 ↓（已禁用）", "slider_min": 0.0, "slider_max": 1.5},
+    {"name": "capture_ratio", "source": "m4", "direction": "max", "enabled": False, "label": "综合捕获比 ↑（已禁用）", "slider_min": 0.0, "slider_max": 5.0},
 ]
 
 DEFAULT_PARAMS: Dict[str, Any] = {
@@ -359,10 +380,30 @@ def assemble_params(
             case "window":
                 window_params[name] = value
 
+    # 训练参数安全上限：截断极端超参，确保单窗口训练 < 60s
+    # 否则 M5 可能搜到 n_est=5000, lr=0.001 导致单 Trial 90 小时
+    _MAX_N_ESTIMATORS = 500
+    _MAX_MAX_DEPTH = 8
+    _MIN_LEARNING_RATE = 0.005
+
+    if lgbm_params.get("n_estimators", 0) > _MAX_N_ESTIMATORS:
+        lgbm_params["n_estimators"] = _MAX_N_ESTIMATORS
+    if xgbm_params.get("n_estimators", 0) > _MAX_N_ESTIMATORS:
+        xgbm_params["n_estimators"] = _MAX_N_ESTIMATORS
+    if lgbm_params.get("max_depth", 0) > _MAX_MAX_DEPTH:
+        lgbm_params["max_depth"] = _MAX_MAX_DEPTH
+    if xgbm_params.get("max_depth", 0) > _MAX_MAX_DEPTH:
+        xgbm_params["max_depth"] = _MAX_MAX_DEPTH
+    if lgbm_params.get("learning_rate", 1.0) < _MIN_LEARNING_RATE:
+        lgbm_params["learning_rate"] = _MIN_LEARNING_RATE
+    if xgbm_params.get("learning_rate", 1.0) < _MIN_LEARNING_RATE:
+        xgbm_params["learning_rate"] = _MIN_LEARNING_RATE
+
     return lgbm_params, xgbm_params, feature_params, lgbm_weight, window_params
 
 assert len(ALL_PARAMS) == 30, f"参数数量:{len(ALL_PARAMS)}"
-assert len(OBJECTIVE_VARS) == 37, f"因变量数量错误:{len(OBJECTIVE_VARS)}"
+# ★ P1 自适应型 2.0 补齐 3 项 M2 因变量后: 49 → 52
+assert len(OBJECTIVE_VARS) == 52, f"因变量数量错误:{len(OBJECTIVE_VARS)} (预期 52)"
 
 # ★ 因变量滑块范围查询表（供app.py的Tab2 filter_sliders使用）
 METRIC_BOUNDS = {
@@ -374,14 +415,21 @@ METRIC_BOUNDS = {
 # 数据: 200701~202512 = 228个月
 # WINDOW_SIZE = train_months + 12(valid) + 1(test)
 # window_count = total_months - WINDOW_SIZE + 1
+# ★ 用户明确要求: M2/M5 都用 155 窗口, 不允许改
+#   m2_engine.run_m2 在 fast_mode=False 时也强制 FIXED_WINDOW_COUNT=155 (line 458)
+#   所以 155 是 M2 全局硬编码, P1/P2/m5tab2 全部一致
 TOTAL_DATA_MONTHS = 228
+# 用户要求: 强制 155 窗口
+FIXED_WINDOW_COUNT = 155
 
 
 def calc_window_count(train_months: int = None) -> int:
-    """根据train_months动态计算全量窗口数"""
-    tm = train_months if train_months is not None else ALL_PARAMS["train_months"]["default"]
-    window_size = tm + 12 + 1
-    return max(TOTAL_DATA_MONTHS - window_size + 1, 0)
+    """强制返回 155 窗口（与 M2 内部 FIXED_WINDOW_COUNT 保持一致）。
+
+    - 任何 train_months 都返回 155 (用户硬性要求)
+    - 兜底: 155
+    """
+    return FIXED_WINDOW_COUNT
 
 
 # ★ 评分归一化配置表（NORM_CONFIG）
@@ -398,6 +446,17 @@ def calc_window_count(train_months: int = None) -> int:
 #   signed_log  → f(x) = sign(x) * log(1 + |x| + eps)
 #                 压缩长尾分布，适用于捕获比、收益率等剧烈波动指标
 # ──────────────────────────────────────────────────────────────────────
+# ★★★ 运行期覆盖声明（自适应分位数归一化）★★★
+# 本 NORM_CONFIG 仅作为【基础兜底骨架】保留，保证系统向下兼容。
+# 运行期，m5_optimizer.adaptive_normalizer.AdaptiveNormalizer 会根据
+# neutralization_type 动态加载 configs/{type}_quantiles.json 中的经验分位数
+# [P5, P50, P95]，完全覆盖重写本表中的静态参数：
+#   - linear 的 bounds [min_b, max_b] → 动态 [P5, P95]
+#   - tanh 的 scale                   → 动态 (P95 - P5) / 2，中心点 P50
+#   - identity / signed_log           → 全面纳入自适应 Tanh 桶
+#   - 污染指标(missing_rate/zero_rate>0.9) → 直接赋予 0.0 跳过
+# 仅当 JSON 配置文件缺失或读取失败时，才 fallback 回本表的静态参数。
+# ──────────────────────────────────────────────────────────────────────
 NORM_CONFIG = {
     # === A 类：值域有明确边界的率指标 → linear（居中到 [-0.5, 0.5]）===
     "val_ic":                  {"method": "linear",  "bounds": [-0.05, 0.05]},
@@ -407,7 +466,7 @@ NORM_CONFIG = {
     "monthly_win_rate":        {"method": "linear",  "bounds": [0.30, 0.70]},
     # === B 类：IR/Sortino 类（集中 0 附近、有时大幅偏离）→ tanh ===
     "val_icir":                {"method": "tanh",    "scale": 2.0},
-    "val_rolling6m_ir":        {"method": "tanh",    "scale": 1.0},
+    "val_rolling6m_ir":        {"method": "tanh",    "scale": 1.5},
     "val_global_ir":           {"method": "tanh",    "scale": 1.5},
     "val_rolling6m_sortino":   {"method": "tanh",    "scale": 2.0},
     "ir_worst_quartile":       {"method": "tanh",    "scale": 2.0},
@@ -417,14 +476,43 @@ NORM_CONFIG = {
     "val_beta":                {"method": "tanh",    "scale": 0.5},
     # ★ P1 自适应型 2.0 仅保留 IC稳定性（std）
     "val_ic_stability":        {"method": "tanh",    "scale": 0.05},
-    # === C 类：长尾/剧烈波动（捕获比、收益率）→ signed_log ===
-    "capture_ratio":           {"method": "signed_log"},
-    "up_capture_ratio":        {"method": "signed_log"},
-    "down_capture_ratio":      {"method": "signed_log"},
+    "val_sqn":                 {"method": "tanh",    "scale": 2.0},
+    # === C 类：捕获比（毛收益口径，值域温和）→ linear ===
+    "capture_ratio":           {"method": "linear",  "bounds": [0.0, 5.0]},
+    "up_capture_ratio":        {"method": "linear",  "bounds": [0.3, 2.0]},
+    "down_capture_ratio":      {"method": "linear",  "bounds": [0.0, 1.5]},
     "val_annual_return":       {"method": "signed_log"},
     "val_rolling6m_return":    {"method": "signed_log"},
     "val_rolling6m_excess":    {"method": "signed_log"},
     "val_rolling6m_excess_ann": {"method": "signed_log"},
+    # === D 类：风险指标 → linear（值域有明确边界）===
+    "var_95":                  {"method": "linear",  "bounds": [-0.15, 0.0]},
+    "cvar_95":                 {"method": "linear",  "bounds": [-0.20, 0.0]},
+    "pain_index":              {"method": "linear",  "bounds": [0.0, 0.15]},
+    "ulcer_index":             {"method": "linear",  "bounds": [0.0, 0.20]},
+    "max_drawdown":            {"method": "linear",  "bounds": [-0.40, 0.0]},
+    # === E 类：M4 比率指标 → tanh / signed_log ===
+    "cagr":                    {"method": "signed_log"},
+    "net_cagr_after_cost":     {"method": "signed_log"},
+    "annual_excess":           {"method": "signed_log"},
+    "sharpe_ratio":            {"method": "tanh",    "scale": 1.0},
+    "sortino_ratio":           {"method": "tanh",    "scale": 1.0},
+    "calmar_ratio":            {"method": "tanh",    "scale": 1.0},
+    "ir":                      {"method": "tanh",    "scale": 1.0},
+    "rolling6m_ir":            {"method": "tanh",    "scale": 1.0},
+    "rolling6m_win_rate":      {"method": "linear",  "bounds": [0.30, 0.80]},
+    "omega_ratio":             {"method": "tanh",    "scale": 1.0},
+    "tail_ratio":              {"method": "tanh",    "scale": 1.0},
+    "burke_ratio":             {"method": "tanh",    "scale": 1.0},
+    "martin_ratio":            {"method": "tanh",    "scale": 1.0},
+    "sterling_ratio":          {"method": "tanh",    "scale": 1.0},
+    "downside_volatility":     {"method": "linear",  "bounds": [0.0, 0.20]},
+    "upside_volatility":       {"method": "linear",  "bounds": [0.0, 0.30]},
+    "volatility_ratio":        {"method": "tanh",    "scale": 1.0},
+    "skewness":                {"method": "tanh",    "scale": 1.0},
+    "kurtosis":                {"method": "tanh",    "scale": 3.0},
+    "avg_monthly_turnover_cost": {"method": "linear","bounds": [0.0, 0.02]},
+    "avg_annual_turnover_cost":  {"method": "linear","bounds": [0.0, 0.20]},
 }
 
 

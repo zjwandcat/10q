@@ -65,6 +65,7 @@ _stop_graceful_event = threading.Event()
 _phase1_thread: Optional[threading.Thread] = None
 _phase2_thread: Optional[threading.Thread] = None
 _factor_df_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()  # v4.1: LRU 缓存 (有界, 最多 2 个)
+_factor_df_lock = threading.Lock()  # ★ v5.0: _factor_df_cache 线程安全锁
 _timer_thread: Optional[threading.Thread] = None
 _timer_stop_event = threading.Event()  # 用于取消定时器
 
@@ -322,12 +323,14 @@ PRESET_TEMPLATES = {
             "val_annual_return":         0.01,
             "val_rolling6m_excess":      0.01,
             # --- 象限四：风险调整后收益与抗跌性 (0.20) ---
-            "val_rolling6m_ir":    0.05,
-            "val_rolling6m_sortino": 0.05,
-            "ir_worst_quartile":    0.05,
-            "val_ir_stability":     0.03,
-            "val_rolling6m_dir":    0.01,
-            "val_global_ir":        0.01,
+            "val_rolling6m_ir":    0.04,
+            "val_rolling6m_sortino": 0.04,
+            "ir_worst_quartile":    0.04,
+            "val_ir_stability":     0.02,
+            "cvar_95":              0.03,
+            "pain_index":           0.02,
+            "val_rolling6m_dir":    0.005,
+            "val_global_ir":        0.005,
             "val_appraisal_ratio":  0.01,
         },
         "active": "ALL_29",
@@ -373,18 +376,18 @@ def _update_m5_gpu_config(enable_gpu: bool, strategy: str = "D"):
 
 def _load_factor_df(scheme: str = None):
     """
-    v4.1: LRU 缓存 (最多 2 个 scheme), 防止 16GB 系统 OOM
-    旧版 _factor_df_cache 是无界 dict, 用户切换 scheme 时会累积所有
-    加载过的 factor_df (每个 ~1-2GB), 最终触发 OS OOM 弹窗
+    v5.0: LRU 缓存 (最多 2 个 scheme), 防止 16GB 系统 OOM
+    ★ v5.0: 加 _factor_df_lock 保证 Tab1/Tab3/Tab2/Tab4 并发安全
     """
     global _factor_df_cache
     cache_key = scheme or "default"
     MAX_CACHE_SIZE = 2   # v4.1: 最多缓存 2 个 scheme (避免 16GB OOM)
 
-    if cache_key in _factor_df_cache:
-        # v4.1: LRU - 移到末尾
-        _factor_df_cache.move_to_end(cache_key)
-        return _factor_df_cache[cache_key]
+    # ★ v5.0: 读缓存加锁（move_to_end 不是线程安全的）
+    with _factor_df_lock:
+        if cache_key in _factor_df_cache:
+            _factor_df_cache.move_to_end(cache_key)
+            return _factor_df_cache[cache_key]
 
     try:
         # ★ 检查可用内存
@@ -398,15 +401,23 @@ def _load_factor_df(scheme: str = None):
                 f"请关闭其他程序后重试"
             )
 
-        # v4.1: 缓存满时清理最早加载的 scheme (OrderedDict 第一项)
-        if len(_factor_df_cache) >= MAX_CACHE_SIZE:
-            oldest_key = next(iter(_factor_df_cache))
-            logger.info(
-                f"[v4.1 LRU] 缓存满 ({len(_factor_df_cache)}/{MAX_CACHE_SIZE}), "
-                f"清理最早 scheme: {oldest_key}")
-            del _factor_df_cache[oldest_key]
-            gc.collect()
+        # ★ v5.0: 写缓存加锁
+        with _factor_df_lock:
+            # double-check: 加锁期间可能另一个线程已经加载了同 key
+            if cache_key in _factor_df_cache:
+                _factor_df_cache.move_to_end(cache_key)
+                return _factor_df_cache[cache_key]
 
+            # 缓存满时清理最早加载的 scheme (OrderedDict 第一项)
+            if len(_factor_df_cache) >= MAX_CACHE_SIZE:
+                oldest_key = next(iter(_factor_df_cache))
+                logger.info(
+                    f"[v4.1 LRU] 缓存满 ({len(_factor_df_cache)}/{MAX_CACHE_SIZE}), "
+                    f"清理最早 scheme: {oldest_key}")
+                del _factor_df_cache[oldest_key]
+                gc.collect()
+
+        # ★ 加载在锁外进行（耗时操作，不阻塞其他线程）
         loader = DataLoader(scheme=scheme)
         factor_df = loader.load()
         factor_df = LabelMaker().make_labels(factor_df)
@@ -416,7 +427,13 @@ def _load_factor_df(scheme: str = None):
         used_gb = (mem.total - mem_after.available) / 1e9
         logger.info(f"数据加载完成(scheme={cache_key})，已用内存: {used_gb:.1f} GB")
 
-        _factor_df_cache[cache_key] = factor_df
+        # ★ v5.0: 写入缓存加锁
+        with _factor_df_lock:
+            # 再次 double-check
+            if cache_key in _factor_df_cache:
+                _factor_df_cache.move_to_end(cache_key)
+                return _factor_df_cache[cache_key]
+            _factor_df_cache[cache_key] = factor_df
         return factor_df
 
     except MemoryError as e:
@@ -487,23 +504,79 @@ def _card(status, project=None, stats=None, message="") -> str:
         ab = stats.get("abnormal", 0)
         f_ = stats["fail"]
         t = stats["total"]
-        best = f"{stats['best_value']:.4f}" if stats.get("best_value") is not None else "暂无有效得分"
+        # ★ Task 3: Optuna 存的是 -score, UI 必须显示真实 score = -best_value
+        # 旧版直接打印 -0.1495 被误读为"最优 0.1495"但符号相反
+        best = f"{-stats['best_value']:.4f}" if stats.get("best_value") is not None else "暂无有效得分"
         return (f"<div style='{base}border-left-color:#2196f3'>"
                 f"🔵 <b>{name}</b> · 进行中<br>"
                 f"<small>📂 {root}</small><br>"
-                f"<small>累计{t}个Trial：有效{c}✅ 异常{ab}⚠️ 失败{f_}❌ · 最优{best}</small>"
+                f"<small>累计{t}个Trial：有效{c}✅ 异常{ab}⚠️ 失败{f_}❌ · 最高分(Score){best}</small>"
                 f"</div>")
 
     if status == "completed" and stats:
         c = stats["complete"]
-        best = f"{stats['best_value']:.4f}" if stats.get("best_value") is not None else "—"
+        # ★ Task 3: 同样修复, 已完成态也需取反
+        best = f"{-stats['best_value']:.4f}" if stats.get("best_value") is not None else "—"
         return (f"<div style='{base}border-left-color:#4caf50'>"
                 f"🟢 <b>{name}</b> · 已完成<br>"
                 f"<small>📂 {root}</small><br>"
-                f"<small>共{c}个有效Trial · 最优{best}</small>"
+                f"<small>共{c}个有效Trial · 最高分(Score){best}</small>"
                 f"</div>")
 
     return f"<div style='{base}border-left-color:#9e9e9e'>⬜ 未知状态</div>"
+
+
+def _render_summary_cards(result: dict, active_track: str = "M2+M3") -> str:
+    m2_metrics = result.get("metrics", {}) or {}
+    m3_metrics = result.get("m3_metrics", None)
+    has_m3 = m3_metrics is not None
+
+    def _card_item(label, m2_val, m3_val=None, fmt=".2%"):
+        m2_s = f"{m2_val:{fmt}}" if isinstance(m2_val, (int, float)) else str(m2_val)
+        m3_s = f"{m3_val:{fmt}}" if isinstance(m3_val, (int, float)) else "—"
+        m3_cell = f"<td style='padding:6px 12px;text-align:right'>{m3_s}</td>" if has_m3 else ""
+        return f"<tr><td style='padding:6px 12px'>{label}</td><td style='padding:6px 12px;text-align:right'>{m2_s}</td>{m3_cell}</tr>"
+
+    m2_cagr = m2_metrics.get("cagr", 0)
+    m2_sharpe = m2_metrics.get("sharpe_ratio", 0)
+    m2_dd = m2_metrics.get("max_drawdown", 0)
+    m2_total = (1 + m2_cagr) ** (m2_metrics.get("n_months", 1) / 12) - 1 if m2_cagr else 0
+
+    rows = [
+        _card_item("总收益率", m2_total, (1 + m3_metrics.get("cagr", 0)) ** (m3_metrics.get("n_months", 1) / 12) - 1 if has_m3 else None),
+        _card_item("CAGR", m2_cagr, m3_metrics.get("cagr") if has_m3 else None),
+        _card_item("夏普比率", m2_sharpe, m3_metrics.get("sharpe_ratio") if has_m3 else None, ".3f"),
+        _card_item("信息比率IR", m2_metrics.get("ir", 0), m3_metrics.get("ir") if has_m3 else None, ".3f"),
+        _card_item("6M滚动IR", m2_metrics.get("rolling6m_ir", 0), m3_metrics.get("rolling6m_ir") if has_m3 else None, ".3f"),
+        _card_item("最大回撤", m2_dd, m3_metrics.get("max_drawdown") if has_m3 else None),
+    ]
+
+    m3_header = "<th style='padding:6px 12px'>M2+M3</th>" if has_m3 else ""
+    header = f"<tr><th style='padding:6px 12px'>指标</th><th style='padding:6px 12px'>纯M2</th>{m3_header}</tr>"
+
+    track_btns = ""
+    if has_m3:
+        m2_bg = "#2196f3" if active_track == "纯M2" else "#f5f5f5"
+        m2_fg = "#fff" if active_track == "纯M2" else "#333"
+        m3_bg = "#2196f3" if active_track == "M2+M3" else "#f5f5f5"
+        m3_fg = "#fff" if active_track == "M2+M3" else "#333"
+        track_btns = (
+            f"<div style='margin:8px 0'>"
+            f"<button style='padding:4px 12px;margin-right:8px;border:1px solid #ccc;border-radius:4px;"
+            f"background:{m2_bg};color:{m2_fg}'>纯M2</button>"
+            f"<button style='padding:4px 12px;border:1px solid #ccc;border-radius:4px;"
+            f"background:{m3_bg};color:{m3_fg}'>M2+M3</button>"
+            f"</div>"
+        )
+
+    return (
+        f"<div style='border:1px solid var(--border-color-primary,#e0e0e0);"
+        f"border-radius:8px;padding:12px 16px;margin:8px 0'>"
+        f"<div style='font-weight:bold;margin-bottom:8px'>📊 性能摘要</div>"
+        f"{track_btns}"
+        f"<table style='border-collapse:collapse;width:100%'>"
+        f"{header}{''.join(rows)}</table></div>"
+    )
 
 
 def _make_progress_callback(log_queue, log_interval_sec: float = 120.0):
@@ -521,7 +594,8 @@ def _make_progress_callback(log_queue, log_interval_sec: float = 120.0):
         lines = [
             f"[{datetime.now().strftime('%H:%M:%S')}] "
             f"Trial {total} | 有效 {trial_num} | "
-            f"最优 {f'{best_val:.4f}' if best_val is not None else '—'}"
+            # ★ Task 3: best_val 是 -score, 取反后才是真实 score, 与卡片"评分="字段绝对一致
+            f"最高分(Score) {f'{-best_val:.4f}' if best_val is not None else '—'}"
         ]
         if time_info and (should_update_time or total <= 3):
             # ★ 修复: trial_callback 改名为 per_trial_str (旧: per_trial_min, 已废弃)
@@ -829,9 +903,7 @@ def build_app():
                 if "choices" in widgets:
                     all_checkboxes.append(widgets["choices"])
 
-            all_lockable = (all_num_boxes +
-                            [scheme_radio] +
-                            list(weight_sliders.values()))
+            all_lockable = [*all_num_boxes, scheme_radio, *weight_sliders.values()]
 
             def _unlock_updates():
                 """返回所有可锁定组件的解锁update列表"""
@@ -1077,6 +1149,54 @@ def build_app():
             range_result_state = gr.State(None)
             status_box = gr.Textbox(label="状态")
 
+            # ★ T2 独立模块：从 P1 选定一个 Trial，触发 M2+M4 完整重跑
+            #   与 Tab4 相对独立：Tab4 走 P2 (Phase2精调)，本模块走 P1 (Phase1全局探索)。
+            #   但产出的 M4 报告路径一致 (output/backtest_report_{scheme}.html)。
+            with gr.Group():
+                gr.Markdown("### 🚀 M2+M3+M4 完整重跑（指定 P1 Trial）")
+                gr.Markdown(
+                    "本模块从 **Phase1 完成的 Trial** 中手动选择一个，用其参数驱动 M2+M4 全量回测并生成 M4 报告。"
+                    "与 Tab4 的区别：Tab4 使用 **P2 (Phase2)** 精调后的 Trial；本处使用 **P1 (Phase1)** 全局探索的 Trial。"
+                    "两者产出的 M4 报告路径与格式一致（`output/backtest_report_{scheme}.html`）。"
+                )
+                with gr.Row():
+                    t2_trial_selector = gr.Dropdown(
+                        label="选择 P1 Trial 编号",
+                        choices=[],
+                        interactive=True,
+                        scale=3,
+                    )
+                    btn_t2_refresh_trials = gr.Button(
+                        "🔄 刷新 Trial 列表", variant="secondary", scale=1
+                    )
+                t2_selected_trial_metrics = gr.Markdown(
+                    "⬜ 请先加载项目，然后点击「刷新 Trial 列表」"
+                )
+
+                with gr.Row():
+                    btn_t2_run_full = gr.Button(
+                        "🔄 触发 M2+M3+M4 完整重跑", variant="primary"
+                    )
+
+                t2_summary_cards = gr.HTML("")
+
+                t2_log_box = gr.Textbox(
+                    label="执行日志", lines=10, autoscroll=True
+                )
+                with gr.Row():
+                    t2_report_path_box = gr.Textbox(
+                        label="报告路径", interactive=False, scale=5
+                    )
+                    btn_t2_open_report = gr.Button("🌐 打开回测报告", scale=1)
+
+            # ★ T2 会话级安全：每个浏览器/标签页独立的日志队列
+            t2_session_state = gr.State({
+                "queue": None,         # 懒加载：首次回测时创建 queue.Queue()
+                "running": False,      # 当前会话是否在跑
+                "log_buffer": [],      # 已派发的日志
+                "report_path": "",     # 用于"打开回测报告"按钮
+            })
+
         # ━━━ Tab3: Phase2 独立精调 ━━━
         with gr.Tab("Phase2 独立精调"):
             with gr.Group():
@@ -1278,15 +1398,15 @@ def build_app():
                 p2_best_score = gr.Number(label="最优得分", value=0)  # noqa: F841
 
             # ★ Tab3 可锁定组件（P2运行中/DB存在时禁止修改）
-            p2_all_lockable = (
-                [btn_save_p2_config, p2_scheme_radio]
-                + list(p2_cat_widgets.values())
-                + [w["checkbox"]    for w in p2_param_widgets.values()]
-                + [w["low"]         for w in p2_param_widgets.values()]
-                + [w["high"]        for w in p2_param_widgets.values()]
-                + [w["default_val"] for w in p2_param_widgets.values()]
-                + list(p2_weight_sliders.values())
-            )
+            p2_all_lockable = [
+                btn_save_p2_config, p2_scheme_radio,
+                *p2_cat_widgets.values(),
+                *[w["checkbox"]    for w in p2_param_widgets.values()],
+                *[w["low"]         for w in p2_param_widgets.values()],
+                *[w["high"]        for w in p2_param_widgets.values()],
+                *[w["default_val"] for w in p2_param_widgets.values()],
+                *p2_weight_sliders.values(),
+            ]
 
             def _p2_lock_updates():
                 """P2 DB存在时锁定所有参数控件"""
@@ -1385,7 +1505,9 @@ def build_app():
 
                 with gr.Row():
                     btn_write_config = gr.Button("💾 写回config.yaml", variant="primary")  # noqa: F841
-                    btn_run_full = gr.Button("🔄 触发M2+M4完整重跑", variant="primary")  # noqa: F841
+                    btn_run_full = gr.Button("🔄 触发M2+M3+M4完整重跑", variant="primary")  # noqa: F841
+
+                t4_summary_cards = gr.HTML("")
 
             log_box_deploy = gr.Textbox(label="执行日志", lines=10, autoscroll=True)  # noqa: F841
             report_path_box = gr.Textbox(label="报告路径", interactive=False)  # noqa: F841
@@ -1470,7 +1592,7 @@ def build_app():
                 p1_project_card,
                 enable_normalization_checkbox,  # ★ v2.0
                 scheme_radio,
-                *list(weight_sliders.values()),
+                *weight_sliders.values(),
                 *all_low_boxes,
                 *all_high_boxes,
                 *all_cat_choices,            # ★ 新增: 4 个 categorical choices
@@ -1529,11 +1651,11 @@ def build_app():
                 f'<span style="color:{color}">权重合计：{total:.2f}</span>'
             )
 
-        weight_inputs = list(weight_sliders.values())
+        weight_inputs = weight_sliders.values()
         for slider in weight_inputs:
             slider.change(
                 fn=update_weight_sum,
-                inputs=weight_inputs,
+                inputs=list(weight_inputs),  # Gradio inputs 需要 list
                 outputs=weight_sum_md
             )
 
@@ -1555,31 +1677,27 @@ def build_app():
                     is_active = name in active
                 param_updates[name] = gr.update(value=is_active)
 
-            return list(weight_updates.values()) + list(param_updates.values())
+            return [*weight_updates.values(), *param_updates.values()]
 
         btn_stable.click(
             fn=lambda: apply_preset("稳健型"),
-            outputs=list(weight_sliders.values()) + [
-                w["checkbox"] for w in param_widgets.values()
-            ]
+            outputs=[*weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()]]
         )
         btn_aggressive.click(
             fn=lambda: apply_preset("激进型"),
-            outputs=list(weight_sliders.values()) + [
-                w["checkbox"] for w in param_widgets.values()
-            ]
+            outputs=[*weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()]]
         )
         btn_defensive.click(
             fn=lambda: apply_preset("防御型"),
-            outputs=list(weight_sliders.values()) + [
-                w["checkbox"] for w in param_widgets.values()
-            ]
+            outputs=[*weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()]]
         )
         btn_adaptive.click(
             fn=lambda: apply_preset("全自适应型"),
-            outputs=list(weight_sliders.values()) + [
-                w["checkbox"] for w in param_widgets.values()
-            ]
+            outputs=[*weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()]]
         )
 
         # ── 专用预设按钮（含范围覆盖 + 热启动） ──
@@ -1632,14 +1750,14 @@ def build_app():
 
             return updates
 
-        _preset_outputs = (
-            list(weight_sliders.values()) +
-            [param_widgets[n]["low"]  for n in numeric_param_names] +
-            [param_widgets[n]["high"] for n in numeric_param_names] +
-            [param_widgets[n]["choices"] for n in categorical_param_names] +
-            [param_widgets[n]["checkbox"] for n in param_widgets] +
-            [warm_start_state]
-        )
+        _preset_outputs = [
+            *weight_sliders.values(),
+            *[param_widgets[n]["low"]  for n in numeric_param_names],
+            *[param_widgets[n]["high"] for n in numeric_param_names],
+            *[param_widgets[n]["choices"] for n in categorical_param_names],
+            *[param_widgets[n]["checkbox"] for n in param_widgets],
+            warm_start_state,
+        ]
 
         btn_preset_b.click(
             fn=lambda: _apply_named_preset("自适应型-b"),
@@ -1728,7 +1846,7 @@ def build_app():
                 # ★ 以下全部新增
                 enable_normalization_checkbox,  # ★ v2.0 归一化开关
                 scheme_radio,
-                *list(weight_sliders.values()),
+                *weight_sliders.values(),
                 *all_low_boxes,
                 *all_high_boxes,
                 *all_cat_choices,            # ★ 新增: 4 个 categorical choices
@@ -1811,14 +1929,14 @@ def build_app():
 
             # 收集权重
             objective_weights = {}
-            weight_names = list(weight_sliders.keys())
+            weight_names = weight_sliders.keys()
             for i, name in enumerate(weight_names):
                 if weight_values[i] and weight_values[i] > 0:
                     objective_weights[name] = float(weight_values[i])
 
             # 收集激活参数
             active_params = []
-            param_names = list(param_widgets.keys())
+            param_names = param_widgets.keys()
             for i, name in enumerate(param_names):
                 if checkbox_values[i]:
                     active_params.append(name)
@@ -1874,7 +1992,7 @@ def build_app():
             try:
                 config_data = load_p1_config(project)
                 config_data["config"]["scheme"] = scheme
-                config_data["config"]["fast_mode"] = False        # ★ 固定False
+                config_data["config"]["fast_mode"] = True         # ★ 强制155窗口
                 config_data["config"]["window_count"] = calc_window_count()
                 config_data["config"]["objective_weights"] = objective_weights
                 config_data["config"]["active_params"] = active_params if active_params else None
@@ -1902,14 +2020,14 @@ def build_app():
 
         btn_save_p1_config.click(
             fn=on_save_p1_config,
-            inputs=(
-                [project_state, scheme_radio, enable_normalization_checkbox]
-                + list(weight_sliders.values())
-                + [w["checkbox"] for w in param_widgets.values()]
-                + [w["choices"] for w in param_widgets.values() if "choices" in w]   # ★ 新增
-                + all_low_boxes    # ★ 新增
-                + all_high_boxes   # ★ 新增
-            ),
+            inputs=[
+                project_state, scheme_radio, enable_normalization_checkbox,
+                *weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()],
+                *[w["choices"] for w in param_widgets.values() if "choices" in w],
+                *all_low_boxes,
+                *all_high_boxes,
+            ],
             outputs=[save_p1_config_status]
         )
 
@@ -1932,18 +2050,18 @@ def build_app():
                                                 num_weights+num_checkboxes+num_categorical]
 
                 objective_weights = {}
-                for i, name in enumerate(list(weight_sliders.keys())):
+                for i, name in enumerate(weight_sliders.keys()):
                     if weight_values[i] and weight_values[i] > 0:
                         objective_weights[name] = float(weight_values[i])
 
                 active_params = []
-                for i, name in enumerate(list(param_widgets.keys())):
+                for i, name in enumerate(param_widgets.keys()):
                     if checkbox_values[i]:
                         active_params.append(name)
 
                 config_data = load_p1_config(project)
                 config_data["config"]["scheme"] = scheme
-                config_data["config"]["fast_mode"] = False        # ★ 固定False
+                config_data["config"]["fast_mode"] = True         # ★ 强制155窗口
                 config_data["config"]["window_count"] = calc_window_count()
                 config_data["config"]["objective_weights"] = objective_weights
                 config_data["config"]["active_params"] = active_params if active_params else None
@@ -1976,14 +2094,14 @@ def build_app():
                 pass  # 自动保存失败不打扰用户
 
         # 绑定自动保存到所有权重滑块和勾选框的change事件
-        auto_save_inputs = (
-            [project_state, scheme_radio, enable_normalization_checkbox]
-            + list(weight_sliders.values())
-            + [w["checkbox"] for w in param_widgets.values()]
-            + [w["choices"] for w in param_widgets.values() if "choices" in w]   # ★ 新增
-        )
+        auto_save_inputs = [
+            project_state, scheme_radio, enable_normalization_checkbox,
+            *weight_sliders.values(),
+            *[w["checkbox"] for w in param_widgets.values()],
+            *[w["choices"] for w in param_widgets.values() if "choices" in w],
+        ]
 
-        for slider in list(weight_sliders.values()):
+        for slider in weight_sliders.values():
             slider.change(
                 fn=auto_save_config,
                 inputs=auto_save_inputs,
@@ -2019,6 +2137,7 @@ def build_app():
 
         # 开始Phase1
         def start_phase1(project, n_trials, scheme, enable_timer_val, timer_hours_val, warm_start, enable_norm, gpu_p1_val, gpu_strategy_p1_val, *all_values):
+            global _phase1_thread
             if project is None:
                 return "❌ 请先加载项目", ""
 
@@ -2045,7 +2164,7 @@ def build_app():
             if warm_start:
                 logger.info(f"热启动先验已加载（{len(warm_start)}个参数）")
 
-            log_msg = f"开始Phase1: {n_trials} trials, fast_mode=False(全量{calc_window_count()}窗口)\n"
+            log_msg = f"开始Phase1: {n_trials} trials, 强制{calc_window_count()}窗口\n"
 
             # ★ 在启动线程/定时器之前先清除停止事件
             _stop_now_event.clear()
@@ -2101,7 +2220,6 @@ def build_app():
                 except Exception as e:
                     logger.error(f"Phase1运行异常: {e}")
 
-            global _phase1_thread
             _phase1_thread = threading.Thread(target=run_thread, daemon=True)
             _phase1_thread.start()
 
@@ -2109,14 +2227,14 @@ def build_app():
 
         btn_start_p1.click(
             fn=start_phase1,
-            inputs=(
-                [project_state, n_trials_slider, scheme_radio, enable_timer_p1, timer_hours_p1, warm_start_state, enable_normalization_checkbox, gpu_p1_checkbox, gpu_strategy_p1]
-                + list(weight_sliders.values())
-                + [w["checkbox"] for w in param_widgets.values()]
-                + [w["choices"] for w in param_widgets.values() if "choices" in w]   # ★ 新增
-                + all_low_boxes    # ★ 新增
-                + all_high_boxes   # ★ 新增
-            ),
+            inputs=[
+                project_state, n_trials_slider, scheme_radio, enable_timer_p1, timer_hours_p1, warm_start_state, enable_normalization_checkbox, gpu_p1_checkbox, gpu_strategy_p1,
+                *weight_sliders.values(),
+                *[w["checkbox"] for w in param_widgets.values()],
+                *[w["choices"] for w in param_widgets.values() if "choices" in w],
+                *all_low_boxes,
+                *all_high_boxes,
+            ],
             outputs=[log_box_p1, timer_status_p1]
         )
 
@@ -2129,11 +2247,10 @@ def build_app():
             if project is None:
                 return "⚡ 立即停止已触发", ""
 
-            # ★ 立即停止：先做一次"快速清理"删除 DB 中已有的 RUNNING/FAIL 残留
-            # 这样用户立刻就能看到 DB 处于一致状态，可以安全关闭程序
-            # （即使主线程仍在跑，DB 已经没有"卡住"的 Trial）
+            # ★ 立即停止：先做一次"快速清理"删除 DB 中已有的 FAIL/WAITING 残留
+            # skip_running=True 避免删除 RUNNING Trial 导致 Phase1 崩溃
             try:
-                quick_result = cleanup_bad_trials(project, phase="p1")
+                quick_result = cleanup_bad_trials(project, phase="p1", skip_running=True)
                 _log_queue_p1.put(
                     f"[{datetime.now().strftime('%H:%M:%S')}] "
                     f"⚡ 立即停止：已快速清理 {quick_result.get('deleted', 0)} 个异常Trial（保留 {quick_result.get('kept', 0)} 个）\n"
@@ -2191,9 +2308,8 @@ def build_app():
             # 分类摘要
             cat = result.get("category", {})
             if any(v > 0 for v in cat.values()):
-                cat_lines = [f"  {k}: {v}" for k, v in cat.items() if v > 0]
                 lines.append("📊 异常分类:")
-                lines.extend(cat_lines)
+                lines.extend(f"  {k}: {v}" for k, v in cat.items() if v > 0)
             if result.get("detail"):
                 lines.append(f"📋 详情(前{len(result['detail'])}条):")
                 lines.extend(f"  {d}" for d in result["detail"])
@@ -2231,14 +2347,14 @@ def build_app():
             # 否则 GPU=False 时 args 错位, _update_m5_gpu_config(weight_val, weight_val) 导致 P1 崩溃
             btn_start_p1.click(
                 fn=start_phase1,
-                inputs=(
-                    [project_state, n_trials_slider, scheme_radio, enable_timer_p1, timer_hours_p1, warm_start_state, enable_normalization_checkbox, gpu_p1_checkbox, gpu_strategy_p1]
-                    + list(weight_sliders.values())
-                    + [w["checkbox"] for w in param_widgets.values()]
-                    + [w["choices"] for w in param_widgets.values() if "choices" in w]   # ★ 新增
-                    + all_low_boxes    # ★ 新增
-                    + all_high_boxes   # ★ 新增
-                ),
+                inputs=[
+                    project_state, n_trials_slider, scheme_radio, enable_timer_p1, timer_hours_p1, warm_start_state, enable_normalization_checkbox, gpu_p1_checkbox, gpu_strategy_p1,
+                    *weight_sliders.values(),
+                    *[w["checkbox"] for w in param_widgets.values()],
+                    *[w["choices"] for w in param_widgets.values() if "choices" in w],
+                    *all_low_boxes,
+                    *all_high_boxes,
+                ],
                 outputs=[log_box_p1, timer_status_p1]
             ).then(fn=lambda: gr.update(active=True), outputs=[log_timer_p1])
             btn_stop_now.click(fn=stop_now, inputs=[project_state], outputs=[log_box_p1, timer_status_p1]).then(fn=lambda: gr.update(active=False), outputs=[log_timer_p1])
@@ -2275,16 +2391,38 @@ def build_app():
         def load_project_for_t2(path):
             if not path or not path.strip():
                 no_update = [gr.update()] * len(all_min_sliders) * 2
-                return (None, "⚠️ 请输入项目文件夹路径", *no_update)
+                # 同时清空 M2+M4 重跑模块
+                t2_extra = [gr.update(choices=[], value=None),
+                            gr.update(value="⬜ 请先加载项目"),
+                            {
+                                "queue": None, "running": False,
+                                "log_buffer": [], "report_path": "",
+                            }]
+                return (None, "⚠️ 请输入项目文件夹路径",
+                        *no_update, *t2_extra)
             result = init_project(path.strip())
             if result["status"] == "conflict":
                 no_update = [gr.update()] * len(all_min_sliders) * 2
-                return (None, "❌ 该路径不是有效项目文件夹", *no_update)
+                t2_extra = [gr.update(choices=[], value=None),
+                            gr.update(value="⬜ 请先加载项目"),
+                            {
+                                "queue": None, "running": False,
+                                "log_buffer": [], "report_path": "",
+                            }]
+                return (None, "❌ 该路径不是有效项目文件夹",
+                        *no_update, *t2_extra)
             project = result["project"]
             p1_study = get_p1_study(project)
             if p1_study is None:
                 no_update = [gr.update()] * len(all_min_sliders) * 2
-                return (project, "⚠️ P1数据库尚未创建，请先运行Phase1", *no_update)
+                t2_extra = [gr.update(choices=[], value=None),
+                            gr.update(value="⚠️ P1数据库尚未创建，无法重跑"),
+                            {
+                                "queue": None, "running": False,
+                                "log_buffer": [], "report_path": "",
+                            }]
+                return (project, "⚠️ P1数据库尚未创建，请先运行Phase1",
+                        *no_update, *t2_extra)
             stats = get_study_stats(p1_study)
 
             # ★ 计算滑块范围时跳过无数据/全 NaN 的指标；
@@ -2293,9 +2431,15 @@ def build_app():
                 min_updates, max_updates = _compute_metric_slider_updates(p1_study)
             except Exception as e:
                 no_update = [gr.update()] * len(all_min_sliders) * 2
+                t2_extra = [gr.update(choices=[], value=None),
+                            gr.update(value="⬜ 请先加载项目"),
+                            {
+                                "queue": None, "running": False,
+                                "log_buffer": [], "report_path": "",
+                            }]
                 return (project,
                         f"⚠️ 项目已加载，但滑块初始化失败（{e}）。请尝试「初始化滑块」按钮。",
-                        *no_update)
+                        *no_update, *t2_extra)
 
             slider_updates = min_updates + max_updates
 
@@ -2305,13 +2449,28 @@ def build_app():
                 f"有效 {stats['complete']} 个，异常 {stats.get('abnormal', 0)} 个，失败 {stats['fail']} 个\n"
                 f"因变量滑块已更新为实际数据范围"
             )
-            return (project, status_text, *slider_updates)
+
+            # ★ 联动刷新 M2+M4 重跑模块的 Trial 列表
+            t2_trial_update = _build_p1_trial_choices(project)
+            t2_metrics_update = gr.update(
+                value=f"📋 已加载 {stats['complete']} 个有效 Trial，"
+                      f"已自动选择得分最高的一个。"
+                      f"如需切换 Trial，请使用「刷新 Trial 列表」下拉框。"
+            )
+            t2_session_update = {
+                "queue": None, "running": False,
+                "log_buffer": [], "report_path": "",
+            }
+            return (project, status_text,
+                    *slider_updates,
+                    t2_trial_update, t2_metrics_update, t2_session_update)
 
         btn_t2_load.click(
             fn=load_project_for_t2,
             inputs=[t2_project_path],
             outputs=[t2_project_state, t2_project_status,
-                     *all_min_sliders, *all_max_sliders]
+                     *all_min_sliders, *all_max_sliders,
+                     t2_trial_selector, t2_selected_trial_metrics, t2_session_state]
         )
 
         def update_matched_count(*args):
@@ -2421,18 +2580,24 @@ def build_app():
                 outputs=[trial_count_display]
             )
 
-        # ★ Tab2 Top-5 排名展示的关键指标（与 Tab4 保持一致）
+        # ★ Tab2 Top-5 排名展示的关键指标（M4 口径统一，与 m5tab2 报告一致）
         TOP5_METRIC_KEYS = [
             ("val_ic", "IC"),
             ("val_icir", "ICIR"),
-            ("val_rolling6m_ir", "6M_IR"),
-            ("pct_positive_excess", "月度超额胜率"),
-            ("val_jensen_alpha", "Jα"),
-            ("val_appraisal_ratio", "AR"),
-            ("up_capture_ratio", "上行捕获比"),
-            ("capture_ratio", "综合捕获比"),
+            ("cagr", "CAGR"),
+            ("sharpe_ratio", "Sharpe"),
+            ("max_drawdown", "最大回撤"),
+            ("calmar_ratio", "Calmar"),
+            ("ir", "IR(M4)"),
+            ("rolling6m_ir", "6M_IR"),
+            ("monthly_win_rate", "月度胜率"),
+            ("up_capture_ratio", "上行捕获"),
+            ("down_capture_ratio", "下行捕获"),
+            ("capture_ratio", "综合捕获"),
+            ("var_95", "VaR95"),
+            ("cvar_95", "CVaR95"),
+            ("pain_index", "痛苦指数"),
             ("penalized_rate", "降权率"),
-            ("val_beta", "β"),
         ]
 
         def _render_top5_html(study, filter_conditions=None, top_n: int = 5, source_tag: str = "P1"):
@@ -2697,7 +2862,7 @@ def build_app():
             p2_weight_values = p2_weight_and_active[:num_p2_weights]
 
             p2_weights = {}
-            p2_weight_names = list(p2_weight_sliders.keys())
+            p2_weight_names = p2_weight_sliders.keys()
             for i, name in enumerate(p2_weight_names):
                 if p2_weight_values[i] and p2_weight_values[i] > 0:
                     p2_weights[name] = p2_weight_values[i]
@@ -2779,8 +2944,312 @@ def build_app():
 
         btn_export_p2.click(
             fn=export_to_p2,
-            inputs=[t2_project_state, range_result_state] + list(p2_weight_sliders.values()),
+            inputs=[t2_project_state, range_result_state, *p2_weight_sliders.values()],
             outputs=[status_box, t3_project_path]
+        )
+
+        # ━━━ Tab2: M2+M4 完整重跑（T2独立模块，使用 P1 Trial）━━━━━━━━
+
+        def _get_p1_study(project):
+            """安全加载P1 study（与 _get_p2_study 配套）"""
+            if project is None:
+                return None
+            p1_db = project.get("p1_db_path", "")
+            if not p1_db or not os.path.exists(p1_db):
+                return None
+            return optuna.load_study(
+                study_name=project.get("p1_study_name", "phase1_global"),
+                storage=f"sqlite:///{p1_db}",
+            )
+
+        def _build_p1_trial_choices(project):
+            """构建 Trial 选择器下拉项：仅展示 COMPLETE 且 score > -999 的 Trial，
+            按原始分倒序排列；choice 格式与 Tab4 保持一致 (TrialN (score=...))。"""
+            empty = gr.update(choices=[], value=None)
+            study = _get_p1_study(project)
+            if study is None:
+                return empty
+            completed = [
+                t for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and t.value is not None and t.value > -999
+            ]
+            if not completed:
+                return empty
+            completed.sort(key=lambda t: -_safe_float(-t.value if t.value is not None else 0.0))
+            choices = [
+                f"Trial {t.number} (score={-t.value:.4f})"
+                for t in completed
+            ]
+            return gr.update(choices=choices, value=choices[0] if choices else None)
+
+        # 刷新 P1 Trial 列表
+        def on_t2_refresh_trials(project):
+            return _build_p1_trial_choices(project)
+
+        btn_t2_refresh_trials.click(
+            fn=on_t2_refresh_trials,
+            inputs=[t2_project_state],
+            outputs=[t2_trial_selector],
+        )
+
+        # 选择 Trial 后显示其参数和指标摘要（M4 口径统一，与 m5tab2 报告一致）
+        def on_t2_trial_select(project, selection):
+            if project is None or not selection:
+                return "⬜ 请先加载项目并选择Trial"
+            try:
+                study = _get_p1_study(project)
+                if study is None:
+                    return "⚠️ P1数据库不存在"
+                trial_num = int(selection.split("(")[0].replace("Trial", "").strip())
+                trial_obj = next((t for t in study.trials if t.number == trial_num), None)
+                if trial_obj is None:
+                    return f"⚠️ Trial #{trial_num} 未找到（可能已被清理）"
+                m = trial_obj.user_attrs if hasattr(trial_obj, "user_attrs") else {}
+                score = -trial_obj.value if trial_obj.value is not None else 0
+                # ★ M4 口径字段 (与 m5tab2 报告完全一致)
+                ic = m.get("val_ic", 0)
+                icir = m.get("val_icir", 0)
+                cagr = m.get("cagr", 0)
+                sharpe = m.get("sharpe_ratio", 0)
+                max_dd = m.get("max_drawdown", 0)
+                calmar = m.get("calmar_ratio", 0)
+                ir_m4 = m.get("ir", 0)
+                ir6m = m.get("rolling6m_ir", 0)
+                win_rate = m.get("monthly_win_rate", 0)
+                upcap = m.get("up_capture_ratio", 0)
+                dncap = m.get("down_capture_ratio", 0)
+                cap = m.get("capture_ratio", 0)
+                var95 = m.get("var_95", 0)
+                pain = m.get("pain_index", 0)
+                pr = m.get("penalized_rate", 0)
+                n_params = len(trial_obj.params)
+                return (
+                    f"**Trial {trial_num}** · 共 {n_params} 个参数 · "
+                    f"**最高分(Score)={score:.4f}** · "
+                    f"IC={ic:.4f} · ICIR={icir:.4f} · "
+                    f"CAGR={cagr:.2%} · Sharpe={sharpe:.2f} · "
+                    f"最大回撤={max_dd:.2%} · Calmar={calmar:.2f} · "
+                    f"IR={ir_m4:.3f} · 6M_IR={ir6m:.3f} · "
+                    f"月度胜率={win_rate:.2%} · "
+                    f"上行捕获={upcap:.2f} · 综合捕获={cap:.2f} · "
+                    f"VaR95={var95:.2%} · 痛苦={pain:.3f} · "
+                    f"降权率={pr:.2%}"
+                )
+            except Exception as e:
+                return f"⚠️ 读取Trial失败：{e}"
+
+        t2_trial_selector.change(
+            fn=on_t2_trial_select,
+            inputs=[t2_project_state, t2_trial_selector],
+            outputs=[t2_selected_trial_metrics],
+        )
+
+        # ★ T2 触发 M2+M4 完整重跑（与 Tab4 on_run_full 同构，但读 P1 study）
+        def on_t2_run_full(project, selection, session_state):
+            """T2 模块触发 M2+M4 完整重跑（每个会话使用独立 queue）"""
+            if project is None or not selection:
+                return (
+                    "请先加载项目并选择 P1 Trial",
+                    gr.update(interactive=True),
+                    session_state,
+                    gr.update(),
+                )
+
+            # ★ v5.1 修复: 内存检查阈值改为软警告，不再硬性阻止
+            # 原因: 用户明确说"6GB 也能跑，慢点没事"。
+            #   旧版 6GB 硬阈值会直接拒绝执行。
+            # 改为：< 3GB 阻止，3-6GB 警告 + 建议关闭 GPU。
+            try:
+                mem = psutil.virtual_memory()
+                _avail_gb = mem.available / 1024**3
+                _min_avail_gb = 3.0
+                if _avail_gb < _min_avail_gb:
+                    return (
+                        f"❌ 可用内存不足（{_avail_gb:.1f}GB < "
+                        f"{_min_avail_gb:.0f}GB），系统+Python 无法正常运作，"
+                        f"请关闭其他程序后重试",
+                        gr.update(interactive=True),
+                        session_state,
+                        gr.update(),
+                    )
+                if _avail_gb < 6.0:
+                    yield_msg = (
+                        f"⚠️ 可用内存偏低（{_avail_gb:.1f}GB < 6GB），"
+                        f"全量回测可能较慢或触发 OOM，"
+                        f"建议关闭 GPU 模式或降低 train_months 后重试"
+                    )
+                    logger.warning(yield_msg)
+            except Exception:
+                pass
+
+            # ★ 懒加载创建本会话专属队列
+            if session_state is None:
+                session_state = {
+                    "queue": None,
+                    "running": False,
+                    "log_buffer": [],
+                    "report_path": "",
+                }
+            if session_state.get("queue") is None:
+                session_state["queue"] = queue.Queue()
+            session_queue = session_state["queue"]
+            session_state["running"] = True
+            session_state["log_buffer"] = []
+            # ★ 重跑前先清空旧报告路径
+            session_state["report_path"] = ""
+
+            def _run(q, state):
+                try:
+                    study = _get_p1_study(project)
+                    if study is None:
+                        q.put("❌ P1数据库不存在")
+                        state["running"] = False
+                        return
+                    trial_num = int(selection.split("(")[0].replace("Trial", "").strip())
+                    trial_obj = next((t for t in study.trials if t.number == trial_num), None)
+                    if trial_obj is None:
+                        q.put(f"❌ Trial #{trial_num} 未找到")
+                        state["running"] = False
+                        return
+                    best_params = dict(trial_obj.params)
+                    # ★ T2 模块：scheme 从 P1 配置读取（与 Tab4 读 P2 不同）
+                    try:
+                        scheme = load_p1_config(project)["config"].get("scheme", "scheme_b")
+                    except Exception:
+                        scheme = "scheme_b"
+                    q.put(f"📦 使用 P1 Trial #{trial_num} · scheme={scheme}")
+
+                    result = run_full_backtest(
+                        best_params=best_params,
+                        scheme=scheme,
+                        include_no_penalty=False,
+                        progress_callback=lambda msg: q.put(msg),
+                        report_tag="t2",  # ★ v5.0: Tab2 报告路径隔离
+                    )
+
+                    rpt = result.get("report_path", "") or ""
+                    if rpt and not os.path.isabs(rpt):
+                        rpt = os.path.abspath(rpt)
+                    state["report_path"] = rpt
+                    state["summary_cards_html"] = _render_summary_cards(result)
+
+                    if rpt and os.path.exists(rpt):
+                        q.put(f"✅ 回测完成！报告路径：{rpt}")
+                    elif rpt:
+                        q.put(f"⚠️ 回测完成但报告文件不存在：{rpt}")
+                    else:
+                        q.put("❌ 回测完成但报告生成失败（请查看 logs/m5_error.log）")
+                    state["running"] = False
+                except Exception as e:
+                    q.put(f"❌ 回测失败：{e}")
+                    state["report_path"] = ""
+                    state["running"] = False
+
+            thread = threading.Thread(
+                target=_run, args=(session_queue, session_state), daemon=True
+            )
+            thread.start()
+            return (
+                "⏳ 回测已启动，请等待...",
+                gr.update(interactive=False),
+                session_state,
+                gr.update(value=""),    # ★ 清空报告路径框
+            )
+
+        btn_t2_run_full.click(
+            fn=on_t2_run_full,
+            inputs=[t2_project_state, t2_trial_selector, t2_session_state],
+            outputs=[t2_log_box, btn_t2_run_full, t2_session_state, t2_report_path_box],
+        )
+
+        # T2 定时器刷新日志（与 Tab4 on_t4_timer_tick 同构）
+        try:
+            t2_timer = gr.Timer(value=1.5, active=False)
+
+            def on_t2_timer_tick(session_state):
+                """定时刷新 T2 模块日志（仅读取本会话队列，绝不串流）"""
+                if session_state is None:
+                    return gr.update(), gr.update(), gr.update(), gr.update()
+                q = session_state.get("queue")
+                if q is None:
+                    return gr.update(), gr.update(), gr.update(), gr.update()
+
+                msgs = []
+                while True:
+                    try:
+                        msgs.append(q.get_nowait())
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+
+                rpt = session_state.get("report_path", "") or ""
+                summary_html = session_state.get("summary_cards_html", "") or ""
+
+                running = session_state.get("running", False)
+                timer_update = gr.update()
+                if not running and not msgs:
+                    timer_update = gr.update(active=False)
+
+                if not msgs:
+                    return gr.update(), rpt, timer_update, summary_html
+
+                session_state["log_buffer"].extend(msgs)
+                _MAX_LOG_BUFFER = 300
+                if len(session_state["log_buffer"]) > _MAX_LOG_BUFFER:
+                    session_state["log_buffer"] = (
+                        session_state["log_buffer"][-_MAX_LOG_BUFFER:]
+                    )
+                return "\n".join(session_state["log_buffer"]), rpt, timer_update, summary_html
+
+            t2_timer.tick(
+                fn=on_t2_timer_tick,
+                inputs=[t2_session_state],
+                outputs=[t2_log_box, t2_report_path_box, t2_timer, t2_summary_cards],
+            )
+
+            # 启动回测时激活定时器
+            btn_t2_run_full.click(
+                fn=lambda: gr.update(active=True),
+                outputs=[t2_timer],
+            )
+        except (AttributeError, TypeError):
+            pass  # Gradio版本不支持Timer
+
+        # T2 打开回测报告（与 Tab4 on_open_report 同构）
+        def on_t2_open_report(report_path):
+            """打开回测报告（兼容绝对/相对路径）"""
+            if not report_path:
+                return "❌ 报告路径为空，请先完成 M2+M4 重跑"
+
+            candidates = [report_path]
+            try:
+                candidates.append(os.path.abspath(report_path))
+            except Exception:
+                pass
+            if not os.path.isabs(report_path):
+                candidates.append(os.path.join(os.getcwd(), report_path))
+
+            existing = next((p for p in candidates if os.path.exists(p)), None)
+            if not existing:
+                return (
+                    f"❌ 报告文件不存在：{report_path}\n"
+                    f"   已尝试: {candidates}"
+                )
+            try:
+                import webbrowser
+                webbrowser.open(f"file:///{os.path.abspath(existing)}")
+                return f"✅ 已打开报告：{os.path.abspath(existing)}"
+            except Exception:
+                return (
+                    f"⚠️ 无法自动打开，请手动打开：{os.path.abspath(existing)}"
+                )
+
+        btn_t2_open_report.click(
+            fn=on_t2_open_report,
+            inputs=[t2_report_path_box],
+            outputs=[t2_log_box],
         )
 
         # ━━━ Tab3: Phase2项目管理事件 ━━━
@@ -2902,16 +3371,16 @@ def build_app():
         btn_t3_load.click(
             fn=on_load_t3_project,
             inputs=[t3_project_path],
-            outputs=(
-                [t3_project_state, t3_project_card, p2_action_row, p2_reset_tip, t4_project_path, p2_scheme_radio]
-                + list(p2_cat_widgets.values())
-                + [w["checkbox"]    for w in p2_param_widgets.values()]
-                + [w["low"]         for w in p2_param_widgets.values()]
-                + [w["high"]        for w in p2_param_widgets.values()]
-                + [w["default_val"] for w in p2_param_widgets.values()]
-                + list(p2_weight_sliders.values())
-                + p2_all_lockable
-            )
+            outputs=[
+                t3_project_state, t3_project_card, p2_action_row, p2_reset_tip, t4_project_path, p2_scheme_radio,
+                *p2_cat_widgets.values(),
+                *[w["checkbox"]    for w in p2_param_widgets.values()],
+                *[w["low"]         for w in p2_param_widgets.values()],
+                *[w["high"]        for w in p2_param_widgets.values()],
+                *[w["default_val"] for w in p2_param_widgets.values()],
+                *p2_weight_sliders.values(),
+                *p2_all_lockable,
+            ]
         )
 
         # P2重置
@@ -2947,7 +3416,7 @@ def build_app():
             default_values  = rest[num_params*3 : num_params * 4]
 
             objective_weights = {}
-            weight_names = list(p2_weight_sliders.keys())
+            weight_names = p2_weight_sliders.keys()
             for i, name in enumerate(weight_names):
                 if weight_values[i] and weight_values[i] > 0:
                     objective_weights[name] = weight_values[i]
@@ -2955,8 +3424,7 @@ def build_app():
             param_ranges   = {}
             excluded_names = []
 
-            param_names = list(p2_param_widgets.keys())
-
+            param_names = p2_param_widgets.keys()
             for i, name in enumerate(param_names):
                 checked     = checkbox_values[i]
                 low_val     = low_values[i]
@@ -3012,20 +3480,21 @@ def build_app():
 
         btn_save_p2_config.click(
             fn=on_save_p2_config,
-            inputs=(
-                [t3_project_state]
-                + list(p2_cat_widgets.values())
-                + list(p2_weight_sliders.values())
-                + [w["checkbox"]    for w in p2_param_widgets.values()]
-                + [w["low"]         for w in p2_param_widgets.values()]
-                + [w["high"]        for w in p2_param_widgets.values()]
-                + [w["default_val"] for w in p2_param_widgets.values()]
-            ),
+            inputs=[
+                t3_project_state,
+                *p2_cat_widgets.values(),
+                *p2_weight_sliders.values(),
+                *[w["checkbox"]    for w in p2_param_widgets.values()],
+                *[w["low"]         for w in p2_param_widgets.values()],
+                *[w["high"]        for w in p2_param_widgets.values()],
+                *[w["default_val"] for w in p2_param_widgets.values()],
+            ],
             outputs=[save_p2_config_status]
         )
 
         # 开始Phase2
         def start_phase2(project, scheme, n_trials, from_best, enable_timer_val, timer_hours_val, lgbm_lr_mode_val, lgbm_depth_mode_val, xgb_lr_mode_val, drop_stn_val, *all_values):
+            global _phase2_thread
             if project is None:
                 return ("❌ 请先加载项目", "") + tuple(_p2_unlock_updates())
 
@@ -3067,7 +3536,7 @@ def build_app():
             default_values  = rest[num_params*3 : num_params * 4]
 
             objective_weights = {}
-            weight_names = list(p2_weight_sliders.keys())
+            weight_names = p2_weight_sliders.keys()
             for i, name in enumerate(weight_names):
                 if weight_values[i] and weight_values[i] > 0:
                     objective_weights[name] = weight_values[i]
@@ -3075,8 +3544,7 @@ def build_app():
             param_ranges   = {}
             excluded_names = []
 
-            param_names = list(p2_param_widgets.keys())
-
+            param_names = p2_param_widgets.keys()
             for i, name in enumerate(param_names):
                 checked     = checkbox_values[i]
                 low_val     = low_values[i]
@@ -3190,7 +3658,6 @@ def build_app():
                 except Exception as e:
                     logger.error(f"Phase2运行异常: {e}")
 
-            global _phase2_thread
             _phase2_thread = threading.Thread(target=run_thread, daemon=True)
             _phase2_thread.start()
 
@@ -3198,17 +3665,17 @@ def build_app():
 
         btn_start_p2.click(
             fn=start_phase2,
-            inputs=(
-                [t3_project_state, p2_scheme_radio, p2_trials, p2_from_best,
-                 enable_timer_p2, timer_hours_p2]
-                + list(p2_cat_widgets.values())
-                + list(p2_weight_sliders.values())
-                + [w["checkbox"]    for w in p2_param_widgets.values()]
-                + [w["low"]         for w in p2_param_widgets.values()]
-                + [w["high"]        for w in p2_param_widgets.values()]
-                + [w["default_val"] for w in p2_param_widgets.values()]
-            ),
-            outputs=[log_box_p2, timer_status_p2] + p2_all_lockable
+            inputs=[
+                t3_project_state, p2_scheme_radio, p2_trials, p2_from_best,
+                enable_timer_p2, timer_hours_p2,
+                *p2_cat_widgets.values(),
+                *p2_weight_sliders.values(),
+                *[w["checkbox"]    for w in p2_param_widgets.values()],
+                *[w["low"]         for w in p2_param_widgets.values()],
+                *[w["high"]        for w in p2_param_widgets.values()],
+                *[w["default_val"] for w in p2_param_widgets.values()],
+            ],
+            outputs=[log_box_p2, timer_status_p2, *p2_all_lockable]
         )
 
         # Phase2停止按钮
@@ -3219,9 +3686,9 @@ def build_app():
             if project is None:
                 return "⚡ 立即停止已触发", ""
 
-            # ★ 立即停止：先做一次"快速清理"删除 DB 中已有的 RUNNING/FAIL 残留
+            # ★ 立即停止：先做一次"快速清理"删除 DB 中已有的 FAIL/WAITING 残留
             try:
-                quick_result = cleanup_bad_trials(project, phase="p2", dry_run=False)
+                quick_result = cleanup_bad_trials(project, phase="p2", dry_run=False, skip_running=True)
                 _log_queue_p2.put(
                     f"[{datetime.now().strftime('%H:%M:%S')}] "
                     f"⚡ 立即停止：已快速清理 {quick_result.get('deleted', 0)} 个异常Trial（保留 {quick_result.get('kept', 0)} 个）\n"
@@ -3267,9 +3734,8 @@ def build_app():
             lines = [result["message"]]
             cat = result.get("category", {})
             if any(v > 0 for v in cat.values()):
-                cat_lines = [f"  {k}: {v}" for k, v in cat.items() if v > 0]
                 lines.append("📊 异常分类:")
-                lines.extend(cat_lines)
+                lines.extend(f"  {k}: {v}" for k, v in cat.items() if v > 0)
             if result.get("detail"):
                 lines.append(f"📋 详情(前{len(result['detail'])}条):")
                 lines.extend(f"  {d}" for d in result["detail"])
@@ -3305,16 +3771,16 @@ def build_app():
             log_timer_p2.tick(fn=refresh_log_p2, inputs=[log_box_p2], outputs=[log_box_p2])
             btn_start_p2.click(
                 fn=start_phase2,
-                inputs=(
-                    [t3_project_state, p2_scheme_radio, p2_trials, p2_from_best,
-                     enable_timer_p2, timer_hours_p2]
-                    + list(p2_cat_widgets.values())
-                    + list(p2_weight_sliders.values())
-                    + [w["checkbox"]    for w in p2_param_widgets.values()]
-                    + [w["low"]         for w in p2_param_widgets.values()]
-                    + [w["high"]        for w in p2_param_widgets.values()]
-                    + [w["default_val"] for w in p2_param_widgets.values()]
-                ),
+                inputs=[
+                    t3_project_state, p2_scheme_radio, p2_trials, p2_from_best,
+                    enable_timer_p2, timer_hours_p2,
+                    *p2_cat_widgets.values(),
+                    *p2_weight_sliders.values(),
+                    *[w["checkbox"]    for w in p2_param_widgets.values()],
+                    *[w["low"]         for w in p2_param_widgets.values()],
+                    *[w["high"]        for w in p2_param_widgets.values()],
+                    *[w["default_val"] for w in p2_param_widgets.values()],
+                ],
                 outputs=[log_box_p2, timer_status_p2] + p2_all_lockable
             ).then(fn=lambda: gr.update(active=True), outputs=[log_timer_p2])
             btn_stop_p2_now.click(fn=stop_p2_now, inputs=[t3_project_state], outputs=[log_box_p2, timer_status_p2]).then(fn=lambda: gr.update(active=False), outputs=[log_timer_p2])
@@ -3432,16 +3898,19 @@ def build_app():
             completed.sort(key=_sort_key)
             top_trials = completed[:min(int(top_n), len(completed))]
 
-            # ★ 关键指标列表（与 Tab2 保持统一：10 项）
+            # ★ 关键指标列表（M4 口径统一, 16 项, 与 m5tab2 报告一致）
             metric_keys = [
                 ("val_ic", "IC"), ("val_icir", "ICIR"),
-                ("val_rolling6m_ir", "6M_IR"),
-                ("pct_positive_excess", "月度超额胜率"),
-                ("val_jensen_alpha", "Jα"), ("val_appraisal_ratio", "AR"),
-                ("up_capture_ratio", "上行捕获比"),
-                ("capture_ratio", "综合捕获比"),
+                ("cagr", "CAGR"), ("sharpe_ratio", "Sharpe"),
+                ("max_drawdown", "最大回撤"), ("calmar_ratio", "Calmar"),
+                ("ir", "IR(M4)"), ("rolling6m_ir", "6M_IR"),
+                ("monthly_win_rate", "月度胜率"),
+                ("up_capture_ratio", "上行捕获"),
+                ("down_capture_ratio", "下行捕获"),
+                ("capture_ratio", "综合捕获"),
+                ("var_95", "VaR95"), ("cvar_95", "CVaR95"),
+                ("pain_index", "痛苦指数"),
                 ("penalized_rate", "降权率"),
-                ("val_beta", "β"),
             ]
 
             # 构建HTML表格
@@ -3671,14 +4140,15 @@ def build_app():
                     ab = stats.get("abnormal", 0)
                     f_ = stats["fail"]
                     t = stats["total"]
-                    best = f"{stats['best_value']:.4f}" if stats.get("best_value") is not None else "暂无"
+                    # ★ Task 3: 修复 best 符号反转, 显示真实 score
+                    best = f"{-stats['best_value']:.4f}" if stats.get("best_value") is not None else "暂无"
 
                     p2_cfg = load_p2_config(project).get("config", {})
                     scheme = p2_cfg.get("scheme", "未知")
 
                     card_html = _card("in_progress" if c < t else "completed",
                                       project=project, stats=stats)
-                    db_info = f"P2 · scheme={scheme} · 有效{c}✅ 异常{ab}⚠️ 失败{f_}❌ · 最优{best}"
+                    db_info = f"P2 · scheme={scheme} · 有效{c}✅ 异常{ab}⚠️ 失败{f_}❌ · 最高分(Score){best}"
 
                     # ★ 检测归一化数据，决定 Radio 是否可切换
                     has_norm = _has_normalized_data(study)
@@ -3822,25 +4292,33 @@ def build_app():
                     })
                 df = pd.DataFrame(rows)
 
-                # 指标摘要
+                # ★ 指标摘要（M4 口径统一, 与 m5tab2 报告一致）
                 m = trial.user_attrs if hasattr(trial, 'user_attrs') else {}
                 score = -trial.value if trial.value is not None else 0
                 ic = m.get("val_ic", 0)
                 icir = m.get("val_icir", 0)
-                ir6m = m.get("val_rolling6m_ir", 0)
-                pos = m.get("pct_positive_excess", 0)
-                ja = m.get("val_jensen_alpha", 0)
-                ar = m.get("val_appraisal_ratio", 0)
+                cagr = m.get("cagr", 0)
+                sharpe = m.get("sharpe_ratio", 0)
+                max_dd = m.get("max_drawdown", 0)
+                calmar = m.get("calmar_ratio", 0)
+                ir_m4 = m.get("ir", 0)
+                ir6m = m.get("rolling6m_ir", 0)
+                win_rate = m.get("monthly_win_rate", 0)
                 upcap = m.get("up_capture_ratio", 0)
                 cap = m.get("capture_ratio", 0)
+                var95 = m.get("var_95", 0)
+                pain = m.get("pain_index", 0)
                 pr = m.get("penalized_rate", 0)
-                beta = m.get("val_beta", 0)
                 summary = (
-                    f"**评分={score:.4f}** · IC={ic:.4f} · ICIR={icir:.4f} · "
-                    f"6M_IR={ir6m:.4f} · 月度超额胜率={pos:.2%} · "
-                    f"Jα={ja:.4f} · AR={ar:.4f} · "
+                    f"**最高分(Score)={score:.4f}** · "
+                    f"IC={ic:.4f} · ICIR={icir:.4f} · "
+                    f"CAGR={cagr:.2%} · Sharpe={sharpe:.2f} · "
+                    f"最大回撤={max_dd:.2%} · Calmar={calmar:.2f} · "
+                    f"IR={ir_m4:.3f} · 6M_IR={ir6m:.3f} · "
+                    f"月度胜率={win_rate:.2%} · "
                     f"上行捕获={upcap:.2f} · 综合捕获={cap:.2f} · "
-                    f"降权率={pr:.2%} · β={beta:.3f}"
+                    f"VaR95={var95:.2%} · 痛苦={pain:.3f} · "
+                    f"降权率={pr:.2%}"
                 )
                 return df, summary
             except Exception as e:
@@ -3934,25 +4412,53 @@ def build_app():
         def on_run_full(project, selection, session_state):
             """触发M2+M4完整重跑（每个会话使用独立 queue）"""
             if project is None or not selection:
-                return "请先加载项目并选择Trial", gr.update(interactive=True), session_state
+                return ("请先加载项目并选择Trial",
+                        gr.update(interactive=True),
+                        session_state,
+                        gr.update())
 
-            # 内存检查
+            # ★ v5.1 修复: 内存检查阈值改为软警告，不再硬性阻止
+            # 原因: 用户明确说"6GB 也能跑，慢点没事"。
+            #   旧版 6GB 硬阈值会直接拒绝执行。
+            # 改为：< 3GB 阻止，3-6GB 警告 + 建议关闭 GPU。
             try:
                 mem = psutil.virtual_memory()
-                if mem.available < 3 * 1024**3:
-                    return (f"❌ 可用内存不足（{mem.available/1024**3:.1f}GB < 3GB），"
-                            f"请关闭其他程序"), gr.update(interactive=True), session_state
+                _avail_gb = mem.available / 1024**3
+                _min_avail_gb = 3.0
+                if _avail_gb < _min_avail_gb:
+                    return (
+                        f"❌ 可用内存不足（{_avail_gb:.1f}GB < "
+                        f"{_min_avail_gb:.0f}GB），系统+Python 无法正常运作，"
+                        f"请关闭其他程序后重试",
+                        gr.update(interactive=True),
+                        session_state,
+                        gr.update(),
+                    )
+                if _avail_gb < 6.0:
+                    yield_msg = (
+                        f"⚠️ 可用内存偏低（{_avail_gb:.1f}GB < 6GB），"
+                        f"全量回测可能较慢或触发 OOM，"
+                        f"建议关闭 GPU 模式或降低 train_months 后重试"
+                    )
+                    logger.warning(yield_msg)
             except Exception:
                 pass
 
             # ★ 懒加载创建本会话专属队列
             if session_state is None:
-                session_state = {"queue": None, "running": False, "log_buffer": []}
+                session_state = {
+                    "queue": None,
+                    "running": False,
+                    "log_buffer": [],
+                    "report_path": "",   # ★ 修复: 用于"打开回测报告"按钮
+                }
             if session_state.get("queue") is None:
                 session_state["queue"] = queue.Queue()
             session_queue = session_state["queue"]
             session_state["running"] = True
             session_state["log_buffer"] = []
+            # ★ 重跑前先清空旧报告路径，避免点旧值
+            session_state["report_path"] = ""
 
             def _run(q, state):
                 try:
@@ -3975,37 +4481,53 @@ def build_app():
                         scheme=scheme,
                         include_no_penalty=False,
                         progress_callback=lambda msg: q.put(msg),
+                        report_tag="t4",  # ★ v5.0: Tab4 报告路径隔离
                     )
 
-                    q.put(f"✅ 回测完成！报告路径：{result.get('report_path', '未知')}")
+                    rpt = result.get("report_path", "") or ""
+                    if rpt and not os.path.isabs(rpt):
+                        rpt = os.path.abspath(rpt)
+                    state["report_path"] = rpt
+                    state["summary_cards_html"] = _render_summary_cards(result)
+
+                    if rpt and os.path.exists(rpt):
+                        q.put(f"✅ 回测完成！报告路径：{rpt}")
+                    elif rpt:
+                        q.put(f"⚠️ 回测完成但报告文件不存在：{rpt}")
+                    else:
+                        q.put("❌ 回测完成但报告生成失败（请查看 logs/m5_error.log）")
                     state["running"] = False
                 except Exception as e:
                     q.put(f"❌ 回测失败：{e}")
+                    state["report_path"] = ""
                     state["running"] = False
 
             thread = threading.Thread(
                 target=_run, args=(session_queue, session_state), daemon=True
             )
             thread.start()
-            return "⏳ 回测已启动，请等待...", gr.update(interactive=False), session_state
+            return ("⏳ 回测已启动，请等待...",
+                    gr.update(interactive=False),
+                    session_state,
+                    gr.update(value=""))   # ★ 清空报告路径框
 
         btn_run_full.click(
             fn=on_run_full,
             inputs=[t4_project_state, t4_trial_selector, t4_session_state],
-            outputs=[log_box_deploy, btn_run_full, t4_session_state],
+            outputs=[log_box_deploy, btn_run_full, t4_session_state, report_path_box],
         )
 
         # Tab4 定时器刷新日志（会话级：仅读取本会话队列）
         try:
-            t4_timer = gr.Timer(value=2.0, active=False)
+            t4_timer = gr.Timer(value=1.5, active=False)
 
             def on_t4_timer_tick(session_state):
                 """定时刷新Tab4日志（仅读取本会话队列，绝不串流）"""
                 if session_state is None:
-                    return gr.update()
+                    return gr.update(), gr.update(), gr.update(), gr.update()
                 q = session_state.get("queue")
                 if q is None:
-                    return gr.update()
+                    return gr.update(), gr.update(), gr.update(), gr.update()
 
                 msgs = []
                 while True:
@@ -4016,17 +4538,29 @@ def build_app():
                     except Exception:
                         break
 
-                if not msgs:
-                    return gr.update()
+                rpt = session_state.get("report_path", "") or ""
+                summary_html = session_state.get("summary_cards_html", "") or ""
 
-                # 追加到 buffer 防止被后续 tick 重复处理
+                running = session_state.get("running", False)
+                timer_update = gr.update()
+                if not running and not msgs:
+                    timer_update = gr.update(active=False)
+
+                if not msgs:
+                    return gr.update(), rpt, timer_update, summary_html
+
                 session_state["log_buffer"].extend(msgs)
-                return "\n".join(session_state["log_buffer"])
+                _MAX_LOG_BUFFER = 300
+                if len(session_state["log_buffer"]) > _MAX_LOG_BUFFER:
+                    session_state["log_buffer"] = (
+                        session_state["log_buffer"][-_MAX_LOG_BUFFER:]
+                    )
+                return "\n".join(session_state["log_buffer"]), rpt, timer_update, summary_html
 
             t4_timer.tick(
                 fn=on_t4_timer_tick,
                 inputs=[t4_session_state],
-                outputs=[log_box_deploy],
+                outputs=[log_box_deploy, report_path_box, t4_timer, t4_summary_cards],
             )
 
             # 启动回测时激活定时器
@@ -4039,15 +4573,34 @@ def build_app():
 
         # Task 17: 打开回测报告
         def on_open_report(report_path):
-            """打开回测报告"""
-            if not report_path or not os.path.exists(report_path):
-                return f"报告文件不存在：{report_path}"
+            """打开回测报告（兼容绝对/相对路径）"""
+            if not report_path:
+                return "❌ 报告路径为空，请先完成 M2+M4 重跑"
+
+            # ★ 修复: report_path_box 里存的是绝对路径，但为了兼容历史数据
+            # 或用户手动输入相对路径，先尝试原值，再尝试 abspath，再尝试 CWD 拼一次
+            candidates = [report_path]
+            try:
+                candidates.append(os.path.abspath(report_path))
+            except Exception:
+                pass
+            if not os.path.isabs(report_path):
+                candidates.append(os.path.join(os.getcwd(), report_path))
+
+            existing = next((p for p in candidates if os.path.exists(p)), None)
+            if not existing:
+                return (
+                    f"❌ 报告文件不存在：{report_path}\n"
+                    f"   已尝试: {candidates}"
+                )
             try:
                 import webbrowser
-                webbrowser.open(f"file:///{os.path.abspath(report_path)}")
-                return f"已打开报告：{report_path}"
+                webbrowser.open(f"file:///{os.path.abspath(existing)}")
+                return f"✅ 已打开报告：{os.path.abspath(existing)}"
             except Exception:
-                return f"无法自动打开，请手动打开：{os.path.abspath(report_path)}"
+                return (
+                    f"⚠️ 无法自动打开，请手动打开：{os.path.abspath(existing)}"
+                )
 
         btn_open_report.click(
             fn=on_open_report,
@@ -4059,17 +4612,70 @@ def build_app():
 
 
 def _memory_watchdog():
-    """内存监控守护线程：每分钟检查一次，超13GB触发内存归还"""
+    """内存监控守护线程：每15秒检查一次，超限触发内存归还+主动止损
+
+    ★ 修复: 间隔从60s→15s，超限不仅归还内存还触发stop_now_event阻止后续Trial
+    旧版60s间隔太长，内存从13GB飙到OOM只需1-2个Trial
+    ★ v4.2: 阈值分层（早警告晚强停），避免半夜疯狂刷屏
+        - avail < 0.2GB  立即停（真紧急）
+        - avail < 1.0GB  仅告警（让当前Trial自然结束，触发下一轮的 Trial#XXX 因内存不足跳过 逻辑）
+        - rss > 13.0GB   强停（即使 avil 够，进程本身也撑不住）
+    """
     while True:
-        time.sleep(60)
+        time.sleep(15)  # ★ 15秒检查一次（旧: 60秒）
         try:
-            mem = psutil.Process(os.getpid()).memory_info().rss / 1e9
-            if mem > 13.0:
+            proc_mem = psutil.Process(os.getpid()).memory_info().rss / 1e9
+            avail_gb = psutil.virtual_memory().available / 1e9
+
+            # ★ 系统可用内存极低：主动止损
+            if avail_gb < 0.2:
                 logger.critical(
-                    f"内存严重超限：{mem:.1f}GB，"
+                    f"内存极度危险：系统可用={avail_gb:.1f}GB，"
+                    f"进程RSS={proc_mem:.1f}GB，触发立即停止"
+                )
+                release_memory_to_os()
+                _stop_now_event.set()
+                # ★ 同步写崩溃安全日志
+                try:
+                    from m5_optimizer.utils.rolling_logger import get_rolling_logger
+                    get_rolling_logger().log_critical(
+                        f"OOM_EMERGENCY_STOP | avail={avail_gb:.1f}GB "
+                        f"rss={proc_mem:.1f}GB, 触发stop_now_event"
+                    )
+                except Exception:
+                    pass
+
+            # ★ 进程RSS超限：强制归还+警告
+            elif proc_mem > 13.0:
+                logger.critical(
+                    f"内存严重超限：RSS={proc_mem:.1f}GB，"
+                    f"系统可用={avail_gb:.1f}GB，"
                     f"程序可能被Windows强制终止"
                 )
                 release_memory_to_os()
+                # ★ 归还后仍超限：触发停止
+                proc_mem_after = psutil.Process(os.getpid()).memory_info().rss / 1e9
+                if proc_mem_after > 13.0:
+                    logger.critical(
+                        f"归还后仍超限：RSS={proc_mem_after:.1f}GB，触发立即停止"
+                    )
+                    _stop_now_event.set()
+                    try:
+                        from m5_optimizer.utils.rolling_logger import get_rolling_logger
+                        get_rolling_logger().log_critical(
+                            f"OOM_STOP_AFTER_RELEASE | rss={proc_mem_after:.1f}GB, "
+                            f"触发stop_now_event"
+                        )
+                    except Exception:
+                        pass
+
+            # ★ 可用内存偏低：警告（让Trial自然结束，objective 入口会跳过）
+            elif avail_gb < 1.0:
+                logger.warning(
+                    f"可用内存偏低：{avail_gb:.1f}GB，RSS={proc_mem:.1f}GB "
+                    f"（仅警告，让当前Trial自然结束，objective入口会主动跳过下一Trial）"
+                )
+
         except Exception:
             pass
 

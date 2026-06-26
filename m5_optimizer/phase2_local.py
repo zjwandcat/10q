@@ -288,6 +288,8 @@ def run_phase2(
         gpu_mode=bool(_get_m5_config().get("optimization", {}).get("gpu_mode", False)),  # ★ v3.8
         enable_normalization=enable_normalization,
         norm_config=norm_config,
+        project_id=project.get("project_name") if project else None,
+        neutralization_type=_get_m5_config().get("data", {}).get("neutralization", {}).get("active_scheme"),
     )
 
     # 时间统计 / trial_callback（共享工具）
@@ -296,6 +298,7 @@ def run_phase2(
         stop_graceful_event=stop_graceful_event,
         stop_now_event=stop_now_event,
         progress_callback=progress_callback,
+        phase="p2",  # ★ v5.0: P2 独立 RSS 历史
     )
 
     # ★ Trial结束后清理内存，避免累积OOM

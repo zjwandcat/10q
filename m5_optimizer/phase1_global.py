@@ -34,6 +34,28 @@ def _get_m5_config():
 logger = logging.getLogger("m5.phase1")
 
 
+def _cleanup_zombie_trials(study) -> int:
+    """0xc0000005 僵尸 Trial 清理：把上次进程崩溃后残留的 RUNNING trial 标记为 FAIL。"""
+    n_cleaned = 0
+    for trial in study.trials:
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+        try:
+            # 通过 tell 将残留 trial 置为失败（values=None，仅更新状态）
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+            n_cleaned += 1
+        except Exception:
+            # 0xc0000005 等异常导致底层状态不一致时，直接操作 storage 兜底
+            try:
+                study._storage.set_trial_state_values(
+                    trial._trial_id, state=optuna.trial.TrialState.FAIL
+                )
+                n_cleaned += 1
+            except Exception:
+                logger.warning(f"无法清理残留 RUNNING trial #{trial.number}", exc_info=True)
+    return n_cleaned
+
+
 def _trial_constraints(trial):
     """
     返回约束违反量列表（<=0表示满足，>0表示违反）
@@ -111,6 +133,11 @@ def run_phase1(
     if project is not None:
         _ensure_wal_safe(project["p1_db_path"])
 
+    # 0xc0000005 僵尸 Trial 清理：在 optimize 前把上次崩溃残留的 RUNNING trial 标记为 FAIL
+    n_cleaned = _cleanup_zombie_trials(study)
+    if n_cleaned:
+        logger.info(f"清理 {n_cleaned} 个残留 RUNNING trial")
+
     # 热启动先验注入：仅在study全新（0个已完成Trial）时注入一次
     if warm_start and len([t for t in study.trials
                            if t.state == optuna.trial.TrialState.COMPLETE
@@ -135,6 +162,8 @@ def run_phase1(
         gpu_mode=bool(_get_m5_config().get("optimization", {}).get("gpu_mode", False)),  # ★ v3.8
         enable_normalization=enable_normalization,
         norm_config=norm_config,
+        project_id=project.get("project_name") if project else None,
+        neutralization_type=_get_m5_config().get("data", {}).get("neutralization", {}).get("active_scheme"),
     )
 
     # 时间统计 / trial_callback（共享工具）
@@ -143,8 +172,11 @@ def run_phase1(
         stop_graceful_event=stop_graceful_event,
         stop_now_event=stop_now_event,
         progress_callback=progress_callback,
+        phase="p1",  # ★ v5.0: P1 独立 RSS 历史
     )
 
+    # catch=(Exception,) 保持原样：可捕获含 RuntimeError 在内的通用异常，
+    # 但不捕获 KeyboardInterrupt/SystemExit，保证用户中断和系统退出能正常生效
     study.optimize(
         objective,
         n_trials=n_trials,
