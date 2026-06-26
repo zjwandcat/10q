@@ -42,6 +42,19 @@ from pathlib import Path
 logger = logging.getLogger("m2.lgbm.v2")
 warnings.filterwarnings("ignore")
 
+
+def _get_seed() -> int:
+    try:
+        import yaml as _yaml
+        _cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f)
+            return int(_cfg.get("m5", {}).get("optimization", {}).get("seed", 42))
+    except Exception:
+        pass
+    return 42
+
 # 自适应线程配置
 config_path = (Path(__file__).parent.parent /
                "config" / "concurrency_config.py")
@@ -179,11 +192,13 @@ class LGBMRanker:
             "reg_lambda":        self.params["reg_lambda"],
             "min_split_gain":    self.params["min_split_gain"],
             "verbosity":         -1,
-            "max_bin":           int(self.params.get("max_bin", 128)),  # ★ v4.2.1: 改 128 (与 m2_engine 一致, 保证 bit-exact)
+            "max_bin":           int(self.params.get("max_bin", 128)),
             "min_data_in_bin":   int(self.params.get("min_data_in_bin", 5)),
             "histogram_pool_size": max(
                 2048, (os.cpu_count() or 8) * 256),
             "nthread":           _nthread,
+            "seed":              _get_seed(),
+            "deterministic":     True,
         }
 
         # ── IC 评估回调 ──

@@ -41,6 +41,19 @@ from pathlib import Path
 logger = logging.getLogger("m2.xgb.v2")
 warnings.filterwarnings("ignore")
 
+
+def _get_seed() -> int:
+    try:
+        import yaml as _yaml
+        _cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f)
+            return int(_cfg.get("m5", {}).get("optimization", {}).get("seed", 42))
+    except Exception:
+        pass
+    return 42
+
 config_path = (Path(__file__).parent.parent /
                "config" / "concurrency_config.py")
 if config_path.exists():
@@ -144,6 +157,7 @@ class XGBRanker:
             "tree_method":      "hist",
             "verbosity":        0,
             "max_bin":          int(self.params.get("max_bin", 128)),
+            "seed":             _get_seed(),
         }
 
         # ★ D 方案: 训练 device="cpu" + single_precision_training=True
@@ -258,23 +272,33 @@ class XGBRanker:
         # v3.8 优化: 接受 numpy 或 DataFrame
         Xv = X.values if hasattr(X, "values") else X
         if use_gpu:
+            # ★ v5.2 关键修复: D 模式 (CPU train + GPU predict) 的 GPU predict
+            #   路径有 XGBoost 设备冲突 bug:
+            #     - xgb.train(device="cpu") 把模型 booster 放在 CPU
+            #     - set_param({"device": "cuda"}) 只切 device param,
+            #       booster 内部节点仍在 CPU
+            #     - inplace_predict(X_cpu) 触发 "Falling back to prediction using
+            #       DMatrix due to mismatched devices", 内存暴涨 5-10x,
+            #       最终 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) 进程被 Windows 强杀
+            #   修复: GPU predict 前先 model.predict() 一次热身, 让 booster
+            #         内部状态真正同步到 GPU. 失败则降级 CPU predict.
             try:
                 self.model_.set_param({"device": "cuda"})
-            except Exception:
-                pass
-            # ★ v3.9 优化: 用 inplace_predict 跳过 DMatrix 包装
-            try:
+                # 热身一次: 喂一个 DMatrix 让 booster 内部 page 到 GPU
+                _dm = xgb.DMatrix(Xv[:1])
+                self.model_.predict(_dm, iteration_range=(0, self.best_iteration_))
+                del _dm
+                # 真正 GPU predict
                 result = np.asarray(self.model_.inplace_predict(
                     Xv,
                     iteration_range=(0, self.best_iteration_)))
                 return result
             except Exception as e:
                 logger.debug(
-                    f"[v4.1 inplace_predict fallback] {type(e).__name__}: "
-                    f"{str(e)[:80]}")
+                    f"[v5.2 GPU predict 失败降级 CPU] {type(e).__name__}: "
+                    f"{str(e)[:120]}")
             finally:
                 # ★ 修复: GPU predict 完成后将模型移回 CPU，释放 CUDA 显存
-                # 否则模型永久驻留 GPU，180 窗口累积后 VRAM 持续增长
                 try:
                     self.model_.set_param({"device": "cpu"})
                 except Exception:
@@ -295,5 +319,5 @@ class XGBRanker:
         scores = self.model_.get_score(
             importance_type=importance_type)
         return pd.Series(
-            list(scores.values()),
-            index=list(scores.keys()))
+            scores.values(),
+            index=scores.keys())

@@ -38,6 +38,19 @@ from pathlib import Path
 logger = logging.getLogger("m2.xgb")
 warnings.filterwarnings("ignore")
 
+
+def _get_seed() -> int:
+    try:
+        import yaml as _yaml
+        _cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f)
+            return int(_cfg.get("m5", {}).get("optimization", {}).get("seed", 42))
+    except Exception:
+        pass
+    return 42
+
 config_path = (Path(__file__).parent.parent /
                "config" / "concurrency_config.py")
 if config_path.exists():
@@ -144,7 +157,8 @@ class XGBRanker:
             "gamma":            self.params["gamma"],
             "tree_method":      "hist",
             "verbosity":        0,
-            "max_bin":          int(self.params.get("max_bin", 128)),   # ★ v3.8: 读 params, 与 m2_engine_gpu 路径一致
+            "max_bin":          int(self.params.get("max_bin", 128)),
+            "seed":             _get_seed(),
         }
 
         if gpu_mode:
@@ -232,5 +246,5 @@ class XGBRanker:
         scores = self.model_.get_score(
             importance_type=importance_type)
         return pd.Series(
-            list(scores.values()),
-            index=list(scores.keys()))
+            scores.values(),
+            index=scores.keys())

@@ -30,6 +30,7 @@ v4.1 简化:
 import pandas as pd
 import numpy as np
 import time
+import gc   # ★ 修复: fit_predict 末尾用 gc.collect() 打破 Booster/Dataset 循环引用，必须 import
 from concurrent.futures import ThreadPoolExecutor
 
 try:
@@ -218,6 +219,8 @@ class EnsemblePredictor:
                          gpu_predict_only=gpu_predict_only)
             return time.time() - t0
 
+        # 并行训练加超时 5 分钟，防止单模型 hang 阻塞整个训练
+        _FIT_TIMEOUT_SEC = 300
         with ThreadPoolExecutor(max_workers=2) as ex:
             fut_lgbm = ex.submit(
                 _fit_lgbm_timed,
@@ -226,8 +229,16 @@ class EnsemblePredictor:
                 _fit_xgb_timed,
                 X_train, y_train, g_train, X_val, y_val, g_val,
                 self._xgb_gpu_predict_only)
-            self._last_lgbm_time = fut_lgbm.result()
-            self._last_xgb_time  = fut_xgb.result()
+            try:
+                self._last_lgbm_time = fut_lgbm.result(timeout=_FIT_TIMEOUT_SEC)
+            except TimeoutError:
+                logger.error(f"LGBM 训练超时 ({_FIT_TIMEOUT_SEC}s)，跳过")
+                self._last_lgbm_time = _FIT_TIMEOUT_SEC
+            try:
+                self._last_xgb_time  = fut_xgb.result(timeout=_FIT_TIMEOUT_SEC)
+            except TimeoutError:
+                logger.error(f"XGB 训练超时 ({_FIT_TIMEOUT_SEC}s)，跳过")
+                self._last_xgb_time = _FIT_TIMEOUT_SEC
 
         t_wall = time.time() - t_wall_start
         sum_t = self._last_lgbm_time + self._last_xgb_time

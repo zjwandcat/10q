@@ -39,6 +39,19 @@ from pathlib import Path
 logger = logging.getLogger("m2.lgbm")
 warnings.filterwarnings("ignore")
 
+
+def _get_seed() -> int:
+    try:
+        import yaml as _yaml
+        _cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f)
+            return int(_cfg.get("m5", {}).get("optimization", {}).get("seed", 42))
+    except Exception:
+        pass
+    return 42
+
 # 自适应线程配置
 config_path = (Path(__file__).parent.parent /
                "config" / "concurrency_config.py")
@@ -183,8 +196,10 @@ class LGBMRanker:
             "verbosity":        -1,
             "device_type":      device_type,
             "histogram_pool_size": max(2048, (os.cpu_count() or 8) * 256),
-            "max_bin":          int(self.params.get("max_bin", 128)),   # ★ v3.8: 读 params, 与 m2_engine_gpu 路径一致 (之前硬编码 128)
-            "min_data_in_bin":  int(self.params.get("min_data_in_bin", 5)),  # ★ v3.8: 与 m2_engine_gpu 一致
+            "max_bin":          int(self.params.get("max_bin", 128)),
+            "min_data_in_bin":  int(self.params.get("min_data_in_bin", 5)),
+            "seed":             _get_seed(),
+            "deterministic":    True,
         }
 
         # GPU模式不设nthread（GPU自管理线程）

@@ -30,5 +30,20 @@ M2 GPU 选股算法引擎 · v2.0 (GTX 1650 4GB 显存优化版)
 """
 from .run_m2 import run_m2
 from .gpu_detector import GPUConfig, STRATEGIES
+from .lgbm_model import LGBMRanker
+from .xgb_model import XGBRanker
+from .ensemble import EnsemblePredictor
+from .feature_store import FeatureStore
+from .portfolio_builder import PortfolioBuilder, calculate_turnover_cost
 
-__all__ = ["run_m2", "GPUConfig", "STRATEGIES"]
+__all__ = [
+    "run_m2",
+    "GPUConfig",
+    "STRATEGIES",
+    "LGBMRanker",
+    "XGBRanker",
+    "EnsemblePredictor",
+    "FeatureStore",
+    "PortfolioBuilder",
+    "calculate_turnover_cost",
+]

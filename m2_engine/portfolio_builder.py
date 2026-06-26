@@ -19,6 +19,7 @@
 is_penalized只作为置信度标记，不影响仓位
 """
 import pandas as pd
+import numpy as np
 from typing import Optional, List, Dict
 import logging
 
@@ -82,6 +83,8 @@ class PortfolioBuilder:
             stock_code, stock_name, industry, score, score_cv,
             tier(High/Low/Reserve), weight, is_holding,
             val_ic, ic_gap, is_penalized, pred_month, trade_date
+            （compute_shap=True 时附加 shap_top{1..3}_factor/value，
+              完整 SHAP 矩阵存到 top20.attrs['shap_values'] + attrs['shap_features']）
         """
         df = pred_df_with_scores.copy()
 
@@ -132,11 +135,56 @@ class PortfolioBuilder:
                 shap_vals = explainer.shap_values(X_holding)
                 if isinstance(shap_vals, list):
                     shap_vals = shap_vals[0]
+                # ★ 改造: Top3 因子列保留（向后兼容），同时把完整 SHAP 矩阵
+                #   存到 top20.attrs，M4 报告模块统一展示。
                 for k in range(min(3, shap_vals.shape[1])):
                     top20[f"shap_top{k+1}_factor"] = (
                         feature_cols[k])
                     top20[f"shap_top{k+1}_value"] = (
                         shap_vals[:, k])
+                top20.attrs["shap_values"] = (
+                    shap_vals.astype(np.float32)
+                )
+                top20.attrs["shap_features"] = list(feature_cols)
+                top20.attrs["shap_source"] = "shap.TreeExplainer"
+            except ImportError:
+                # ★ 新增: shap 未装时回退到 LightGBM 内置特征重要性
+                # 首次警告，后续不再 spam
+                if not getattr(PortfolioBuilder,
+                               "_shap_warned", False):
+                    logger.warning(
+                        "未安装 shap，回退到 LightGBM "
+                        "feature_importance_。M4 报告仍可展示"
+                        "因子贡献（精度低于真 SHAP）。"
+                        "安装: pip install shap")
+                    PortfolioBuilder._shap_warned = True
+                try:
+                    fi = (lgbm_model.model_.feature_importances_
+                          if hasattr(lgbm_model, "model_")
+                          and hasattr(lgbm_model.model_,
+                                       "feature_importances_")
+                          else None)
+                    if fi is not None and len(fi) == len(feature_cols):
+                        order = np.argsort(-fi)[:3]
+                        for k, idx in enumerate(order):
+                            top20[f"shap_top{k+1}_factor"] = (
+                                feature_cols[idx])
+                            top20[f"shap_top{k+1}_value"] = (
+                                float(fi[idx]))
+                        # 构造"伪 SHAP 矩阵"：每行 = 因子重要性 / N
+                        n_holding = len(top20)
+                        pseudo = np.tile(
+                            fi / max(fi.sum(), 1e-9),
+                            (n_holding, 1)
+                        ).astype(np.float32) * float(n_holding)
+                        top20.attrs["shap_values"] = pseudo
+                        top20.attrs["shap_features"] = list(
+                            feature_cols)
+                        top20.attrs["shap_source"] = (
+                            "lgbm.feature_importances_"
+                            " (shap未安装,回退)")
+                except Exception as e2:
+                    logger.warning(f"SHAP回退也失败: {e2}")
             except Exception as e:
                 logger.warning(f"SHAP计算失败: {e}")
 
