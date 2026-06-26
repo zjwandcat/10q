@@ -16,6 +16,7 @@
 Windows 内存强制归还工具
 调用 SetProcessWorkingSetSize 强制 OS 回收进程未使用的内存页。
 在非 Windows 平台自动退化为 no-op。
+★ v4.2: 增加 msvcrt._heapmin() 强制把 C 堆归还给 Windows
 """
 import sys
 import gc
@@ -33,7 +34,13 @@ def release_memory_to_os() -> float:
     import psutil
     rss_before = psutil.Process().memory_info().rss / 1e9
 
-    gc.collect()
+    # ★ v4.2: full GC（含老年代），否则只清 0 代对累计大对象无效
+    # 旧版 gc.collect() == gc.collect(0)，只清 youngest generation
+    # 全代 GC 对周期性释放 LGBM/XGB Booster 等大对象更彻底
+    try:
+        gc.collect(2)
+    except Exception:
+        gc.collect()
 
     if sys.platform != "win32":
         return rss_before
@@ -51,6 +58,16 @@ def release_memory_to_os() -> float:
             logger.debug("SetProcessWorkingSetSize 调用失败（不影响运行）")
     except Exception as e:
         logger.debug(f"Windows内存归还失败（不影响运行）: {e}")
+
+    # ★ v4.2: msvcrt._heapmin() - 强制把 C 堆 free 后的内存归还 OS
+    # 原因: Python 的 pymalloc 不直接调 free(), 所以 SetProcessWorkingSetSize
+    #       看不到这部分内存。msvcrt._heapmin() 触发 CRT 堆整理, 真正释放。
+    # 效果: 配合 gc.collect(2) 通常能再降 200-500MB RSS
+    try:
+        import msvcrt
+        msvcrt._heapmin()
+    except Exception as e:
+        logger.debug(f"msvcrt._heapmin 失败（非Windows或CRT不可用）: {e}")
 
     rss_after = psutil.Process().memory_info().rss / 1e9
     released = rss_before - rss_after

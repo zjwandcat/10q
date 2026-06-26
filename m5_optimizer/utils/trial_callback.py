@@ -28,6 +28,7 @@ def make_trial_callback(
     stop_graceful_event,
     stop_now_event=None,
     progress_callback: Optional[Callable] = None,
+    phase: str = "p1",  # ★ v5.0: 区分 P1/P2 的 RSS 检测
 ) -> Callable:
     """
     生成 trial_callback：每完成一个Trial触发一次progress_callback，
@@ -179,5 +180,27 @@ def make_trial_callback(
             attrs,
             time_info,
         )
+
+        # ★ v4.2 方案A: Trial 完成后强制全代 GC，释放 LGBM/XGB Booster 等大对象
+        # 原因: Optuna 的 catch=(Exception,) 会保留 Trial 内部引用，
+        #       Python 默认 gc.collect(0) 不清老年代，导致 RSS 累积上涨
+        try:
+            import gc as _gc
+            _gc.collect(2)
+        except Exception:
+            pass
+
+        # ★ v4.2 方案D: RSS 增长率检测，发现内存泄漏主动停止
+        # 阈值: 最近 20 个 Trial 内 RSS 增长 > 20% 且 > 0.5GB → 判定泄漏
+        try:
+            from m5_optimizer.utils.restart_check import check_rss_leak
+            check_rss_leak(
+                trial_number=trial.number,
+                stop_now_event=stop_now_event,
+                graceful_stop_event=stop_graceful_event,
+                phase=phase,  # ★ v5.0: 传入 phase 区分 RSS 历史
+            )
+        except Exception:
+            pass  # 检测失败不影响主流程
 
     return trial_callback
