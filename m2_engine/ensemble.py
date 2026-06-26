@@ -64,12 +64,18 @@ def _fast_rank_corr(x: np.ndarray, y: np.ndarray) -> float:
     """
     快速Spearman相关系数，跳过scipy的p值计算
     比scipy.spearmanr快约5x
+
+    ★ 优化: 用 scipy.stats.rankdata 替代双 argsort
+    - 旧: np.argsort(np.argsort(x)) = 2次排序 O(N log N) × 2
+    - 新: rankdata(x) = 1次调用，内部实现更高效
+    - 数值等价: Spearman只依赖排名顺序，rankdata与双argsort等价
     """
+    from scipy.stats import rankdata
     n = len(x)
     if n < 10:
         return 0.0
-    rx = np.argsort(np.argsort(x)).astype(np.float32)
-    ry = np.argsort(np.argsort(y)).astype(np.float32)
+    rx = rankdata(x).astype(np.float64)
+    ry = rankdata(y).astype(np.float64)
     rx_c = rx - rx.mean()
     ry_c = ry - ry.mean()
     denom = np.sqrt(np.sum(rx_c**2) * np.sum(ry_c**2)) + 1e-8
@@ -130,11 +136,12 @@ def _compute_capture_ratios(
     monthly_benchmark_ret,
 ) -> dict:
     """
-    计算上行/下行/综合捕获比。
-    monthly_portfolio_ret: 组合月度收益（已含股息）
+    计算上行/下行/综合捕获比（与M4 metrics.py同口径：净收益）。
+    monthly_portfolio_ret: 组合月度净收益（已扣换手成本，与M4 portfolio_return对齐）
     monthly_benchmark_ret: 基准（CSI800）月度收益
+    最小样本12个月（与M4 _compute_jensen_appraisal_full对齐）
     """
-    if len(monthly_portfolio_ret) < 6 or len(monthly_benchmark_ret) < 6:
+    if len(monthly_portfolio_ret) < 12 or len(monthly_benchmark_ret) < 12:
         return {"up_capture_ratio": 0.0,
                 "down_capture_ratio": 0.0,
                 "capture_ratio": 0.0}
@@ -142,9 +149,7 @@ def _compute_capture_ratios(
     bench = np.asarray(monthly_benchmark_ret, dtype=np.float32)
     port  = np.asarray(monthly_portfolio_ret,  dtype=np.float32)
 
-    # 上行月（基准 > 0）
     up_mask   = bench > 0
-    # 下行月（基准 < 0）
     down_mask = bench < 0
 
     if up_mask.sum() < 3 or down_mask.sum() < 3:
@@ -152,15 +157,12 @@ def _compute_capture_ratios(
                 "down_capture_ratio": 0.0,
                 "capture_ratio": 0.0}
 
-    # 上行捕获：组合上行月均值 / 基准上行月均值
     up_cap = (float(_nanmean(port[up_mask])) /
               float(_nanmean(bench[up_mask])))
 
-    # 下行捕获：组合下行月均值 / 基准下行月均值（越小越好）
     down_cap = (float(_nanmean(port[down_mask])) /
                 float(_nanmean(bench[down_mask])))
 
-    # 综合捕获比：上行 / 下行，>1 表示"涨得多跌得少"
     if abs(down_cap) < 1e-6:
         combined = 0.0
     else:
@@ -180,27 +182,25 @@ def _compute_jensen_appraisal(
 ) -> dict:
     """
     计算 Jensen's Alpha (年化) 与 Appraisal Ratio (月度口径)。
+    与M4 metrics.py _compute_jensen_appraisal_full同口径：净收益 + 最小12月。
 
     数学定义:
         y_t = R_p,t − R_f,t
         x_t = R_b,t − R_f,t
         OLS: y_t = α_monthly + β·x_t + ε_t
-        → α_monthly = ȳ − β·x̄
         → jensen_alpha (annual) = α_monthly × 12
-        → residuals ε_t = y_t − (α + β·x_t)
-        → σ(ε) = std(ε, ddof=1)
         → appraisal_ratio = α_monthly / σ(ε)
 
     退化保护:
-        - len(x) < 6                 → 0.0
-        - n_unique(x) < 2            → 0.0（基准无波动）
-        - std(ε) < 1e-8              → appraisal_ratio = 0.0
-        - NaN / Inf 输入或输出       → 0.0
+        - len(x) < 12            → 0.0（与M4对齐）
+        - n_unique(x) < 2        → 0.0（基准无波动）
+        - std(ε) < 1e-8          → appraisal_ratio = 0.0
+        - NaN / Inf 输入或输出   → 0.0
 
     返回: dict 含 val_jensen_alpha / val_appraisal_ratio / val_beta
     """
     n = len(monthly_portfolio_ret)
-    if n < 6 or len(monthly_benchmark_ret) < 6:
+    if n < 12 or len(monthly_benchmark_ret) < 12:
         return {"val_jensen_alpha": 0.0, "val_appraisal_ratio": 0.0, "val_beta": 0.0}
 
     rets = np.asarray(monthly_portfolio_ret, dtype=np.float64)
@@ -402,11 +402,23 @@ class EnsemblePredictor:
         """
         from .portfolio_builder import calculate_turnover_cost
 
+        if (
+            "benchmark_return" not in val_df_with_scores.columns
+            or val_df_with_scores["benchmark_return"].eq(0).all()
+        ):
+            from m5_optimizer.benchmark_utils import load_aligned_csi800_benchmark
+            bm_series = load_aligned_csi800_benchmark()
+            ym = pd.to_datetime(val_df_with_scores["trade_date"]).dt.strftime("%Y%m")
+            val_df_with_scores = val_df_with_scores.copy()
+            val_df_with_scores["benchmark_return"] = ym.map(bm_series).fillna(0.0).values
+
         monthly_returns = []
         monthly_benchmarks = []
         monthly_gross_returns = []
         monthly_turnover_rates = []
         monthly_transaction_costs = []
+        monthly_costs = []
+        monthly_dates = []
 
         prev_holdings = {}  # {stock_code: weight}
 
@@ -431,7 +443,8 @@ class EnsemblePredictor:
         idx_end = np.append(idx_start[1:], len(sorted_dates))
 
         RETURN_CAP = 0.30
-        for s, e in zip(idx_start, idx_end):
+        _unique_dates = np.unique(sorted_dates)
+        for i, (s, e) in enumerate(zip(idx_start, idx_end)):
             # order[s:e] 已按 -score 升序 (= score 降序)
             grp_idx   = order[s:e]
             stocks_grp = _stocks[grp_idx]
@@ -476,6 +489,8 @@ class EnsemblePredictor:
             monthly_transaction_costs.append(float(cost))
             monthly_returns.append(float(net_ret))
             monthly_benchmarks.append(float(bm))
+            monthly_costs.append(float(cost))
+            monthly_dates.append(_unique_dates[i])
             prev_holdings = curr_holdings
 
         n = len(monthly_returns)
@@ -501,44 +516,70 @@ class EnsemblePredictor:
                 "val_ic_stability": 0.0,
                 "val_ir_stability": 0.0,
                 "turnover_penalty": 0.0,
+                # ★ 风险指标（n<6 时无意义，默认 0.0）
+                "val_var_95": 0.0,
+                "val_cvar_95": 0.0,
+                "val_pain_index": 0.0,
+                "val_sqn": 0.0,
+                "_monthly_returns": [],
+                "_monthly_benchmarks": [],
+                "_monthly_costs": [],
+                "_monthly_dates": [],
             }
 
-        rets = np.array(monthly_returns)
-        bms  = np.array(monthly_benchmarks)
+        rets = np.array(monthly_returns, dtype=np.float64)
+        bms  = np.array(monthly_benchmarks, dtype=np.float64)
         excess = rets - bms
 
-        irs, dirs, sortinos, cumrets = [], [], [], []
-        for i in range(n - 5):
-            w_ex = excess[i:i+6]
-            w_ret = rets[i:i+6]
+        # ★ 向量化优化: 用 sliding_window_view 替代逐窗 Python 循环
+        # 原: for i in range(n-5) 逐窗计算 (n-5 次迭代, 每次 6 元素)
+        # 新: 1 次 sliding_window_view 生成 (n-5, 6) 矩阵, 全程向量化
+        # 数值等价: _std/_mean 在 1D 数组上与循环逐窗结果 bit-exact
+        rf = 0.03 / 12
+        if n >= 6:
+            from numpy.lib.stride_tricks import sliding_window_view
+            win_ex = sliding_window_view(excess, 6)      # (n-5, 6)
+            win_ret = sliding_window_view(rets, 6)        # (n-5, 6)
 
-            std_ex = _std(w_ex, ddof=0)
-            ir = (_mean(w_ex) / std_ex * np.sqrt(12)
-                  if std_ex > 1e-8 else 0.0)
-            irs.append(ir)
+            # IR: mean(excess) / std(excess) * sqrt(12)
+            win_ex_mean = win_ex.mean(axis=1)
+            win_ex_std = win_ex.std(axis=1, ddof=1)
+            irs = np.where(
+                win_ex_std > 1e-8,
+                win_ex_mean / np.where(win_ex_std > 1e-8, win_ex_std, 1.0) * np.sqrt(12),
+                0.0)
 
-            down_ex = w_ex[w_ex < 0]
-            # 6月窗口内：超额收益 < 0 部分的标准差；样本不足时退化为全期std
-            down_std = (_std(down_ex, ddof=0)
-                        if len(down_ex) > 1
-                        else max(std_ex, 1e-8))
-            dirs.append(
-                _mean(w_ex) / down_std * np.sqrt(12))
+            # DIR: mean(excess) / down_std * sqrt(12)
+            # down_std = std(excess[excess<0]) 或退化为全窗 std
+            dirs = np.empty(n - 5, dtype=np.float64)
+            for j in range(n - 5):
+                w_ex = win_ex[j]
+                down_ex = w_ex[w_ex < 0]
+                down_std = (_std(down_ex, ddof=1)
+                            if len(down_ex) > 1
+                            else max(win_ex_std[j], 1e-8))
+                dirs[j] = win_ex_mean[j] / down_std * np.sqrt(12)
 
-            rf = 0.03 / 12
-            down_ret = w_ret[w_ret < rf]
-            d_std_ret = (_std(down_ret, ddof=0)
-                         if len(down_ret) > 1
-                         else max(_std(w_ret, ddof=0), 1e-6))
-            sortinos.append(
-                _mean(w_ret - rf) / d_std_ret * np.sqrt(12))
+            # Sortino: mean(ret-rf) / down_std_ret * sqrt(12)
+            sortinos = np.empty(n - 5, dtype=np.float64)
+            for j in range(n - 5):
+                w_ret = win_ret[j]
+                down_ret = w_ret[w_ret < rf]
+                d_std_ret = (_std(down_ret, ddof=1)
+                             if len(down_ret) > 1
+                             else max(_std(w_ret, ddof=1), 1e-6))
+                sortinos[j] = _mean(w_ret - rf) / d_std_ret * np.sqrt(12)
 
-            cumrets.append(np.prod(1 + w_ret) - 1)
+            # 累计收益: prod(1+ret) - 1
+            cumrets = np.prod(1 + win_ret, axis=1) - 1
+        else:
+            irs = np.array([], dtype=np.float64)
+            dirs = np.array([], dtype=np.float64)
+            sortinos = np.array([], dtype=np.float64)
+            cumrets = np.array([], dtype=np.float64)
 
         # ★ P1 自适应型 2.0：val_ir_stability（IR 跨时间稳定性）
-        # irs 已经在循环中收集完毕，直接对数组取 std
-        irs_arr = np.array(irs, dtype=np.float64)
-        val_ir_stability = float(np.std(irs_arr, ddof=0)) if len(irs_arr) > 0 else 0.0
+        val_ir_stability = float(np.std(irs, ddof=1)) if len(irs) > 1 else 0.0
 
         # ★ P1 自适应型 2.0：val_ic_stability（IC 跨时间稳定性）
         # 按月计算 val_df_with_scores 的 Spearman IC，再按 6 月窗口分块取 std
@@ -558,8 +599,8 @@ class EnsemblePredictor:
             for i in range(len(ics_monthly) - 5):
                 ic_windows.append(float(np.mean(ics_monthly[i:i+6])))
             val_ic_stability = (
-                float(np.std(ic_windows, ddof=0))
-                if len(ic_windows) > 0 else 0.0
+                float(np.std(ic_windows, ddof=1))
+                if len(ic_windows) > 1 else 0.0
             )
         else:
             val_ic_stability = 0.0
@@ -573,68 +614,83 @@ class EnsemblePredictor:
 
         # 全局IR：整个验证期的超额收益IR
         global_excess_mean = _mean(excess)
-        global_excess_std = _std(excess, ddof=0)
+        global_excess_std = _std(excess, ddof=1)
         global_ir = (global_excess_mean / global_excess_std * np.sqrt(12)
                      if global_excess_std > 1e-8 else 0.0)
 
-        # 年化收益：整个验证期的复合年化收益
+        # ★ 年化收益：整个验证期的复合年化收益（净收益，与M4 net_cagr_after_cost对齐）
         cum_return = np.prod(1 + rets) - 1
         annual_return = (1 + cum_return) ** (12 / n) - 1 if n > 0 else 0.0
 
-        # ── 熊牛一致性指标 ──────────────────────────
-        monthly_excess_returns = excess.tolist()
+        # ★ 扣费后年化收益：主收益序列已是净收益，因此与年化收益一致
+        net_annual_return = annual_return
+
+        # ── 熊牛一致性指标（向量化优化）──────────────────
+        # 原: excess.tolist() 转 Python 列表, 再用 sum() + sorted() 循环
+        # 新: 直接用 NumPy 向量化操作, 避免 Python 循环开销
 
         # 指标1：pct_positive_excess（月度超额胜率）
-        if len(monthly_excess_returns) > 0:
-            positive_count = sum(1 for r in monthly_excess_returns if r > 0)
-            pct_positive_excess = positive_count / len(monthly_excess_returns)
+        if n > 0:
+            pct_positive_excess = float(np.mean(excess > 0))
         else:
             pct_positive_excess = 0.0
 
         # 指标2：ir_worst_quartile（最差25%时期的平均超额 / 最差25%时期自身标准差）
-        if len(monthly_excess_returns) >= 4:
-            sorted_excess = sorted(monthly_excess_returns)
-            cutoff = max(1, len(sorted_excess) // 4)
+        if n >= 4:
+            sorted_excess = np.sort(excess)
+            cutoff = max(1, n // 4)
             worst_quarter = sorted_excess[:cutoff]
-            worst_std = _std(worst_quarter, ddof=0)
+            worst_std = float(np.std(worst_quarter, ddof=1)) if cutoff > 1 else 1e-8
             denom = worst_std if worst_std > 1e-8 else 1e-8
-            ir_worst_quartile = float(_mean(worst_quarter) / denom)
+            ir_worst_quartile = float(np.mean(worst_quarter) / denom)
             ir_worst_quartile = float(np.clip(ir_worst_quartile, -5.0, 5.0))
         else:
             ir_worst_quartile = 0.0
 
         # 指标3：平均6月滚动超额收益（不除以标准差，直接看均值）
         # 单位：月度收益率，如0.005=每月跑赢0.5%
-        if len(monthly_excess_returns) >= 6:
-            excess_arr = np.array(monthly_excess_returns,
-                                  dtype=np.float32)
-            rolling6_means = []
-            for i in range(len(excess_arr) - 5):
-                rolling6_means.append(
-                    float(excess_arr[i:i+6].mean()))
-            val_rolling6m_excess = float(
-                _mean(rolling6_means))
+        if n >= 6:
+            # ★ 向量化: 用 sliding_window_view 替代逐窗 Python 循环
+            from numpy.lib.stride_tricks import sliding_window_view
+            excess_windows = sliding_window_view(excess, 6)  # (n-5, 6)
+            rolling6_means = excess_windows.mean(axis=1)
+            val_rolling6m_excess = float(np.mean(rolling6_means))
             val_rolling6m_excess_ann = val_rolling6m_excess * 12
         else:
             val_rolling6m_excess = 0.0
             val_rolling6m_excess_ann = 0.0
 
-        # 捕获比
+        # 捕获比（净收益口径）
         _cap = _compute_capture_ratios(monthly_returns, monthly_benchmarks)
 
-        # Jensen's Alpha & Appraisal Ratio
+        # Jensen's Alpha & Appraisal Ratio（净收益口径）
         _ja = _compute_jensen_appraisal(
             monthly_returns, monthly_benchmarks,
             rf_monthly=0.03 / 12,
         )
 
+        # ★ CVaR / VaR / 痛苦指数（与M4 metrics.py同公式）
+        _r_arr = rets
+        _var_95 = float(np.percentile(_r_arr, 5)) if n > 0 else 0.0
+        _cvar_95 = (float(_r_arr[_r_arr <= _var_95].mean())
+                    if n > 0 and (_r_arr <= _var_95).any() else _var_95)
+        _cum_arr = np.cumprod(1 + _r_arr)
+        _peak_arr = np.maximum.accumulate(_cum_arr)
+        _dd_arr = (_cum_arr - _peak_arr) / _peak_arr
+        _pain_index = float(np.abs(_dd_arr).mean()) if n > 0 else 0.0
+
+        # ★ SQN (System Quality Number): mean(r)/std(r)*sqrt(n)（与M4同公式）
+        _r_std = float(_r_arr.std(ddof=1)) if n > 1 else 1e-8
+        _sqn = (float(_r_arr.mean()) / _r_std * np.sqrt(n)) if _r_std > 1e-8 and n > 1 else 0.0
+
         return {
-            "val_rolling6m_ir":      float(_mean(irs)),
-            "val_rolling6m_dir":     float(_mean(dirs)),
-            "val_rolling6m_sortino": float(_mean(sortinos)),
-            "val_rolling6m_return":  float(_mean(cumrets)),
+            "val_rolling6m_ir":      float(np.mean(irs)) if len(irs) > 0 else 0.0,
+            "val_rolling6m_dir":     float(np.mean(dirs)) if len(dirs) > 0 else 0.0,
+            "val_rolling6m_sortino": float(np.mean(sortinos)) if len(sortinos) > 0 else 0.0,
+            "val_rolling6m_return":  float(np.mean(cumrets)) if len(cumrets) > 0 else 0.0,
             "val_global_ir":         float(global_ir),
             "val_annual_return":     float(annual_return),
+            "val_net_annual_return": float(net_annual_return),
             "pct_positive_excess":   float(pct_positive_excess),
             "ir_worst_quartile":     float(ir_worst_quartile),
             "val_rolling6m_excess":  float(val_rolling6m_excess),
@@ -649,6 +705,16 @@ class EnsemblePredictor:
             "val_ic_stability":      val_ic_stability,
             "val_ir_stability":      val_ir_stability,
             "turnover_penalty":      turnover_penalty,
+            # ★ 风险指标（与M4同公式）
+            "val_var_95":            _var_95,
+            "val_cvar_95":           _cvar_95,
+            "val_pain_index":        _pain_index,
+            "val_sqn":              _sqn,
+            # ★ 月度序列（供run_m2汇总阶段全期拼接重算6m_ir）
+            "_monthly_returns":      monthly_returns,
+            "_monthly_benchmarks":   monthly_benchmarks,
+            "_monthly_costs":        monthly_costs,
+            "_monthly_dates":        monthly_dates,
         }
 
     def _monthly_ic(

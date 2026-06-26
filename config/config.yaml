@@ -5,23 +5,23 @@ backtest:
 data:
   index_dir: data/index/
   neutralization:
-    active_scheme: scheme_d
+    active_scheme: scheme_b
     available_schemes:
       scheme_a: 双重OLS正交化（机构标准版）
       scheme_b: Rank-Z+双重OLS（推荐，抗极端值）
-      scheme_d: 仅行业OLS（对照组）
-      scheme_e: 分层中性化（行业内Rank+全截面市值OLS）
       scheme_b1: 非线性市值OLS（B基础 + ln(M)^2 + ln(M)^3，截面 demean 防御高阶共线性）
       scheme_b2: WLS 加权（sqrt(mktcap) 对角权重，缺 mktcap 内部退化为等权 OLS）
+      scheme_d: 仅行业OLS（对照组）
+      scheme_e: 分层中性化（行业内Rank+全截面市值OLS）
       scheme_f: 风格因子剥离（B基础 + 动量/换手/波动率 等 Barra 风格，缺列 raise）
       scheme_g: PCA 隐式风险（60 天 log-return 矩阵纯 NumPy SVD，缺矩阵 raise）
     params:
       scheme_b1:
-        mktcap_degree: 3
         demean_log_mktcap: true
+        mktcap_degree: 3
       scheme_b2:
-        weight: sqrt_mktcap
         nan_to_zero: true
+        weight: sqrt_mktcap
       scheme_f:
         style_factors:
         - momentum_return_20d
@@ -31,16 +31,16 @@ data:
         - liquidity_turnover_20d
         - liquidity_turnover_60d
       scheme_g:
+        alignment: drop
         lookback_days: 60
         n_components: 5
-        alignment: drop
   pool_dirs:
     scheme_a: data/pool_v2_scheme_a/
     scheme_b: data/pool_v2_scheme_b/
-    scheme_d: data/pool_v2_scheme_d/
-    scheme_e: data/pool_v2_scheme_e/
     scheme_b1: data/pool_v2_scheme_b1/
     scheme_b2: data/pool_v2_scheme_b2/
+    scheme_d: data/pool_v2_scheme_d/
+    scheme_e: data/pool_v2_scheme_e/
     scheme_f: data/pool_v2_scheme_f/
     scheme_g: data/pool_v2_scheme_g/
   raw_cache_dir: data/raw_cache/
@@ -56,28 +56,38 @@ data:
 m2:
   ensemble:
     ic_penalize_threshold: 0.15
-    lgbm_weight: 0.5
+    lgbm_weight: 0.5749110810020995
   feature_store:
-    max_corr: 0.95
-    min_ic_abs: 0.003
-    min_keep_factors: 50
-    min_valid_rate: 0.3
+    drop_short_term_noise: true
+    max_corr: 0.8954213559262452
+    min_ic_abs: 0.0036716385837220456
+    min_keep_factors: 119
+    min_valid_rate: 0.2533443503695497
   lgbm:
-    colsample_bytree: 0.3
-    learning_rate: 0.05
+    colsample_bytree: 0.18887082389944992
+    decay_every: 44
+    decay_factor: 0.8249770672475284
+    depth_mode: adaptive
+    early_stopping_rounds: 28
+    learning_rate: 0.034343365993636486
+    lr_mode: decay
     max_depth: 4
-    min_split_gain: 0.01
-    n_estimators: 300
-    reg_alpha: 0.1
-    reg_lambda: 1.0
+    min_split_gain: 0.02372465868922967
+    n_estimators: 134
+    reg_alpha: 0.1374419958646639
+    reg_lambda: 9.244205025648862
   xgb:
-    colsample_bytree: 0.3
-    gamma: 0.01
-    learning_rate: 0.05
-    max_depth: 4
-    n_estimators: 300
-    reg_alpha: 0.1
-    reg_lambda: 1.0
+    colsample_bytree: 0.29008473259790757
+    decay_every: 44
+    decay_factor: 0.8725387409075263
+    early_stopping_rounds: 35
+    gamma: 0.004389230674569045
+    learning_rate: 0.04903978775323511
+    lr_mode: decay
+    max_depth: 2
+    n_estimators: 285
+    reg_alpha: 0.5811900280206528
+    reg_lambda: 1.9076264212699676
 m5:
   gradio:
     server_name: 127.0.0.1
@@ -85,8 +95,8 @@ m5:
   optimization:
     fast_mode: false
     fast_window_count: 60
-    full_window_count: 173
-    gpu_mode: true
+    full_window_count: 155
+    gpu_mode: false
     gpu_strategy: D
     n_jobs: 1
     phase1_trials: 50
@@ -112,9 +122,7 @@ portfolio:
 rolling:
   step_months: 1
   test_months: 1
-  train_months: 36
+  train_months: 43
   valid_months: 12
-# Tushare token 不要再写在这里！从环境变量 TUSHARE_TOKEN 读取
-# 设置方法（PowerShell）：$env:TUSHARE_TOKEN = "你的token"
 tushare:
-  token: ""
+  token: c2e70ad0fd8c4a3cee1eff75b56e68f801444c15af4000b946d13b2d

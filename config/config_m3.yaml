@@ -1,0 +1,103 @@
+# M3 TET 风控外挂模块配置文件
+# 版本: 1.0.0
+# 依赖: M0 因子库, M2 持仓输出
+# 理论: Dr. Oliver Reiss《Trend-Emotion-Timing》(NAAIM Founders Award 2025)
+
+tet_params:
+  # === 趋势因子（4 大类分层投票）===
+  trend_factors:
+    # A. 动量收益率类 (RoC) - 14 个因子
+    # >0 投 +1，否则 -1
+    momentum:
+      - momentum_return_5d
+      - momentum_return_10d
+      - momentum_return_20d
+      - momentum_return_40d
+      - momentum_return_60d
+      - momentum_return_90d
+      - momentum_return_120d
+      - momentum_return_180d
+      - momentum_return_240d
+      - sup_mom_jt_12_1
+      - technical_roc_10d
+      - technical_roc_20d
+      - technical_roc_60d
+      - technical_roc_120d
+
+    # B. 均线偏离类 (MA Ratio) - 8 个因子
+    # ratio 类 >1 投 +1，position 类 >threshold 投 +1，否则 -1
+    ma_ratio_gt1:
+      - technical_price_ma_ratio_5d
+      - technical_price_ma_ratio_10d
+      - technical_price_ma_ratio_20d
+      - technical_price_ma_ratio_60d
+    # 字典格式 {col: threshold}：col > threshold 投 +1
+    ma_ratio_gt_threshold:
+      technical_boll_pos_20d: 0.5
+      jq_price_position_20d: 0.5
+      jq_price_position_60d: 0.5
+      jq_ma_deviation_20d: 0.0   # >0 投 +1
+
+    # C. 均线交叉类 (Crossover) - 5 对因子
+    # [factor_a, factor_b]，a>b 投 +1，否则 -1
+    # 特殊：[col, 0] 表示 col > 0 投 +1（单因子判定）
+    crossover:
+      - [technical_ma_10d, technical_ma_60d]
+      - [technical_ma_20d, technical_ma_120d]
+      - [technical_macd_dif, technical_macd_dea]
+      - [sup_tech_ma_cross_5_20, 0]      # 单因子 >0 投 +1
+      - [sup_tech_ma_cross_20_60, 0]     # 单因子 >0 投 +1
+
+    # D. 动量强度类 (Strength) - 13 个因子
+    # >0 投 +1，否则 -1
+    strength:
+      - sup_mom_strength_20d
+      - sup_mom_strength_60d
+      - sup_mom_strength_120d
+      - sup_mom_accel
+      - momentum_sharpe_20d
+      - momentum_sharpe_60d
+      - momentum_sharpe_120d
+      - momentum_sharpe_240d
+      - technical_momentum_10d
+      - technical_momentum_20d
+      - technical_macd_hist
+      - momentum_score
+      - momentum_weighted_20d
+
+  # === 情绪振荡器（12 个，必须声明 direction）===
+  # direction: "positive" 表示正向指标（RSI/KDJ/CCI）
+  # direction: "negative" 表示反向指标（WR，值越大越超卖）
+  emotion_indicators:
+    - name: "momentum_rsi_6d"
+      direction: "positive"
+    - name: "momentum_rsi_14d"
+      direction: "positive"
+    - name: "momentum_rsi_20d"
+      direction: "positive"
+    - name: "momentum_rsi_30d"
+      direction: "positive"
+    - name: "sup_tech_rsi_6"
+      direction: "positive"
+    - name: "sup_tech_rsi_14"
+      direction: "positive"
+    - name: "sup_tech_rsi_24"
+      direction: "positive"
+    - name: "technical_kdj_rsv_9d"
+      direction: "positive"
+    - name: "technical_kdj_rsv_14d"
+      direction: "positive"
+    - name: "technical_kdj_rsv_20d"
+      direction: "positive"
+    - name: "technical_kdj_rsv_30d"
+      direction: "positive"
+    - name: "technical_willr_10d"
+      direction: "negative"     # ★ WR 是反向指标
+
+  # === 超参（M5 可调）===
+  sell_threshold: -1.0          # Timing < sell_threshold 触发 SELL_TET
+  hys_band: 0.05                # Schmitt Trigger 滞后带宽
+  risk_free_rate_annual: 0.025  # fallback：Shibor 缺失时使用
+  rf_source: "shibor_dynamic"   # 'fixed' 或 'shibor_dynamic'
+  scheme: "scheme_d"            # M0 pool 目录后缀
+  debug_csv: true               # 是否落盘 m3_debug/YYYYMM.csv

@@ -167,7 +167,7 @@ class FactorCalculator:
 
         # 1-8: 基硔回报率因子
         windows = {"5d": 5, "10d": 10, "20d": 20, "40d": 40,
-                   "60d": 60, "90d": 90, "120d": 120, "180d": 180}
+                   "60d": 60, "90d": 90, "120d": 120, "180d": 180, "240d": 240}
         for name, w in windows.items():
             if len(close) > w:
                 factors[f"momentum_return_{name}"] = float(close[0] / close[w] - 1)
@@ -1122,6 +1122,12 @@ class FactorCalculator:
         else:
             for i in range(16, 21):
                 factors[f"jq_tech_{i}"] = np.nan
+
+        # 21: 60日价格位置
+        if len(close) > 60:
+            factors["jq_price_position_60d"] = float((close[0] - np.min(close[:60])) / (np.max(close[:60]) - np.min(close[:60]) + 1e-8))
+        else:
+            factors["jq_price_position_60d"] = np.nan
 
         return factors
 

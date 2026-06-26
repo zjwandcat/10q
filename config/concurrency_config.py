@@ -43,8 +43,10 @@ DATA_LOADER_MAX_WORKERS = min(_LOGICAL_CORES, 4)
 M0_FETCH_MAX_WORKERS = min(_PHYSICAL_CORES, 2)
 
 # ── 内存红线（降低避免OOM）──────────────────────
-MEMORY_LIMIT_GB  = 8.0
-MEMORY_BUFFER_GB = 1.0
+# ★ v4.2: 物理 RAM 16GB 时建议 ≤ 6GB 留出系统+其他程序
+#   旧值 8GB 太激进，半夜会撑爆分页文件（你当前分页文件只有 2GB）
+MEMORY_LIMIT_GB  = 6.0
+MEMORY_BUFFER_GB = 1.5
 
 # ── 启动时打印确认 ───────────────────────────────
 print(f"[并发配置] 物理核={_PHYSICAL_CORES} "
